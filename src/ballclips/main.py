@@ -319,6 +319,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_initial_region: CropRegion | None = None
         self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
+        self._crop_region_dirty = False
         self._current_video_file: Path | None = None
         self._discoverer: GstPbutilsTypes.Discoverer | None = None  # type: ignore[attr-defined]
         self._discoverer_failed = not _GST_PBUTILS_AVAILABLE
@@ -400,6 +401,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._current_video_file = video_file
         self._current_video_pixel_size = self._probe_video_size(video_file)
         self._ensure_crop_defaults(video_file)
+        self._crop_region_dirty = False
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
         self._title_label.set_text(video_file.name)
@@ -744,6 +746,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
             with metadata_path.open("w", encoding="utf-8") as handle:
                 json.dump(metadata, handle, indent=2, sort_keys=True)
                 handle.write("\n")
+            self._crop_region_dirty = False
         except OSError as exc:
             print(
                 f"Failed to write metadata for '{video_file.name}': {exc}",
@@ -881,8 +884,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
             and abs(current.center_y - updated.center_y) <= self._crop_edit_tolerance
             and abs(current.size - updated.size) <= self._crop_edit_tolerance
         ):
+            if persist and self._crop_region_dirty:
+                self._persist_metadata_for_current_video()
             return
         self._video_crop_regions[self._current_video_file][key] = updated
+        self._crop_region_dirty = True
         self._crop_overlay.queue_draw()
         if persist:
             self._persist_metadata_for_current_video()
