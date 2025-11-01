@@ -99,7 +99,7 @@ class BallclipsApplication(Gtk.Application):
         if self._window is not None:
             self._window.destroy()
             self._window = None
-        super().do_shutdown()
+        Gtk.Application.do_shutdown(self)
 
 
 def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
