@@ -99,11 +99,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         progress_scale.set_draw_value(False)
         progress_scale.connect("value-changed", self._on_progress_changed)
 
+        goto_in_button = Gtk.Button(label="→{")
+        goto_in_button.connect("clicked", self._on_go_to_in_clicked)
+
         set_in_button = Gtk.Button(label="{")
         set_in_button.connect("clicked", self._on_set_in_clicked)
 
         set_out_button = Gtk.Button(label="}")
         set_out_button.connect("clicked", self._on_set_out_clicked)
+
+        goto_out_button = Gtk.Button(label="→}")
+        goto_out_button.connect("clicked", self._on_go_to_out_clicked)
 
         trim_area = Gtk.DrawingArea()
         trim_area.set_hexpand(True)
@@ -123,24 +129,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         timeline_grid.set_column_spacing(6)
         timeline_grid.set_hexpand(True)
 
-        left_spacer = Gtk.Box()
-        right_spacer = Gtk.Box()
-
-        timeline_grid.attach(left_spacer, 0, 0, 1, 1)
+        timeline_grid.attach(goto_in_button, 0, 0, 1, 1)
         timeline_grid.attach(progress_scale, 1, 0, 1, 1)
-        timeline_grid.attach(right_spacer, 2, 0, 1, 1)
+        timeline_grid.attach(goto_out_button, 2, 0, 1, 1)
 
         timeline_grid.attach(set_in_button, 0, 1, 1, 1)
         timeline_grid.attach(trim_area, 1, 1, 1, 1)
         timeline_grid.attach(set_out_button, 2, 1, 1, 1)
 
-        left_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
-        left_group.add_widget(left_spacer)
-        left_group.add_widget(set_in_button)
-
-        right_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
-        right_group.add_widget(right_spacer)
-        right_group.add_widget(set_out_button)
+        button_width_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
+        button_width_group.add_widget(goto_in_button)
+        button_width_group.add_widget(set_in_button)
+        button_width_group.add_widget(goto_out_button)
+        button_width_group.add_widget(set_out_button)
 
         controls.pack_start(timeline_grid, True, True, 0)
 
@@ -252,6 +253,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._updating_progress = True
         self._progress_adjustment.set_value(value_seconds)
         self._updating_progress = False
+
+    def _seek_to_seconds(self, value_seconds: float) -> None:
+        upper = self._progress_adjustment.get_upper()
+        if upper <= 0.0:
+            return
+        clamped_value = max(0.0, min(upper, value_seconds))
+        position_ns = int(clamped_value * Gst.SECOND)
+        self._set_progress_value(clamped_value)
+        self._player.seek_simple(
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+            position_ns,
+        )
 
     def _on_prev_clicked(self, _button: Gtk.Button) -> None:
         self._load_video(self._current_index - 1)
@@ -381,6 +395,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._trim_out_seconds = max(position, self._trim_in_seconds)
         self._pending_trim_reset = False
         self._trim_area.queue_draw()
+
+    def _on_go_to_in_clicked(self, _button: Gtk.Button) -> None:
+        self._seek_to_seconds(self._trim_in_seconds)
+
+    def _on_go_to_out_clicked(self, _button: Gtk.Button) -> None:
+        self._seek_to_seconds(self._trim_out_seconds)
 
 
 class BallclipsApplication(Gtk.Application):
