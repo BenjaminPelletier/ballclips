@@ -14,7 +14,7 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Gst", "1.0")
 
-from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango, GstPbutils, cairo
 
 
 @dataclass
@@ -30,16 +30,23 @@ class CropRegion:
             size=max(0.0, min(self.size, 1.0)),
         )
 
-    def to_rectangle(self, width: int, height: int) -> tuple[float, float, float]:
-        min_dimension = max(1, min(width, height))
+    def to_rectangle(
+        self,
+        width: float,
+        height: float,
+        *,
+        offset_x: float = 0.0,
+        offset_y: float = 0.0,
+    ) -> tuple[float, float, float]:
+        min_dimension = max(1.0, min(width, height))
         size_px = max(0.0, self.size) * min_dimension
-        center_x_px = self.center_x * width
-        center_y_px = self.center_y * height
+        center_x_px = offset_x + self.center_x * width
+        center_y_px = offset_y + self.center_y * height
         half = size_px / 2.0
         left = center_x_px - half
         top = center_y_px - half
-        left = max(0.0, min(left, width - size_px))
-        top = max(0.0, min(top, height - size_px))
+        left = max(offset_x, min(left, offset_x + width - size_px))
+        top = max(offset_y, min(top, offset_y + height - size_px))
         return left, top, size_px
 
 
@@ -227,6 +234,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
         self._current_video_file: Path | None = None
+        self._discoverer: GstPbutils.Discoverer | None = None
+        self._discoverer_failed = False
+        self._current_video_pixel_size: tuple[float, float] | None = None
 
         self._load_video(self._current_index)
 
@@ -301,6 +311,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._current_index = index % len(self._video_files)
         video_file = self._video_files[self._current_index]
         self._current_video_file = video_file
+        self._current_video_pixel_size = self._probe_video_size(video_file)
         self._ensure_crop_defaults(video_file)
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
@@ -322,6 +333,48 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_overlay.queue_draw()
 
         self._app.set_current_index(self._current_index)
+
+    def _ensure_discoverer(self) -> GstPbutils.Discoverer | None:
+        if self._discoverer is not None or self._discoverer_failed:
+            return self._discoverer
+        try:
+            self._discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
+        except GLib.Error as exc:
+            print(
+                f"Failed to initialise GStreamer discoverer: {exc.message}",
+                file=sys.stderr,
+            )
+            self._discoverer_failed = True
+            self._discoverer = None
+        return self._discoverer
+
+    def _probe_video_size(self, video_file: Path) -> tuple[float, float] | None:
+        discoverer = self._ensure_discoverer()
+        if discoverer is None:
+            return None
+        try:
+            info = discoverer.discover_uri(Gst.filename_to_uri(str(video_file.resolve())))
+        except GLib.Error as exc:
+            print(
+                f"Unable to inspect video metadata for '{video_file.name}': {exc.message}",
+                file=sys.stderr,
+            )
+            return None
+
+        for stream in info.get_video_streams():
+            if not isinstance(stream, GstPbutils.DiscovererVideoInfo):
+                continue
+            width = float(stream.get_width())
+            height = float(stream.get_height())
+            if width <= 0.0 or height <= 0.0:
+                continue
+            par_num = stream.get_par_num()
+            par_den = stream.get_par_den()
+            if par_num > 0 and par_den > 0:
+                width *= par_num / par_den
+            return width, height
+
+        return None
 
     def _on_destroy(self, *_args: object) -> None:
         self._player.set_state(Gst.State.NULL)
@@ -443,6 +496,60 @@ class PlayerWindow(Gtk.ApplicationWindow):
         stored = self._video_crop_regions[video_file][key]
         return stored.clamped()
 
+    def _get_video_display_rect(
+        self, width: int, height: int
+    ) -> tuple[float, float, float, float]:
+        if width <= 0 or height <= 0:
+            return 0.0, 0.0, 0.0, 0.0
+        if not self._current_video_pixel_size:
+            return 0.0, 0.0, float(width), float(height)
+        video_w, video_h = self._current_video_pixel_size
+        if video_w <= 0 or video_h <= 0:
+            return 0.0, 0.0, float(width), float(height)
+        scale = min(width / video_w, height / video_h)
+        display_width = video_w * scale
+        display_height = video_h * scale
+        offset_x = (width - display_width) / 2.0
+        offset_y = (height - display_height) / 2.0
+        return offset_x, offset_y, display_width, display_height
+
+    def _clamp_region_to_video_area(
+        self, region: CropRegion, rect: tuple[float, float, float, float]
+    ) -> CropRegion:
+        offset_x, offset_y, video_w, video_h = rect
+        if video_w <= 0 or video_h <= 0:
+            return region.clamped()
+        min_dimension = min(video_w, video_h)
+        if min_dimension <= 0:
+            return CropRegion(0.5, 0.5, 0.0)
+        size_px = max(0.0, min(region.size, 1.0)) * min_dimension
+        half = size_px / 2.0
+        center_x_px = region.center_x * video_w
+        center_y_px = region.center_y * video_h
+        center_x_px = max(half, min(center_x_px, video_w - half))
+        center_y_px = max(half, min(center_y_px, video_h - half))
+        normalized_size = size_px / min_dimension if min_dimension > 0 else 0.0
+        center_x = center_x_px / video_w if video_w > 0 else 0.5
+        center_y = center_y_px / video_h if video_h > 0 else 0.5
+        return CropRegion(center_x, center_y, normalized_size).clamped()
+
+    def _point_in_video_area(self, x: float, y: float, width: int, height: int) -> bool:
+        offset_x, offset_y, video_w, video_h = self._get_video_display_rect(width, height)
+        if video_w <= 0 or video_h <= 0:
+            return False
+        return (
+            offset_x <= x <= offset_x + video_w
+            and offset_y <= y <= offset_y + video_h
+        )
+
+    def _region_to_rectangle(
+        self, region: CropRegion, rect: tuple[float, float, float, float]
+    ) -> tuple[float, float, float]:
+        offset_x, offset_y, video_w, video_h = rect
+        if video_w <= 0 or video_h <= 0:
+            return 0.0, 0.0, 0.0
+        return region.to_rectangle(video_w, video_h, offset_x=offset_x, offset_y=offset_y)
+
     def _set_crop_region(
         self,
         key: Literal["in", "out"],
@@ -479,7 +586,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         fill_rgba: tuple[float, float, float, float],
         stroke_rgba: tuple[float, float, float, float],
     ) -> bool:
-        left, top, size = region.to_rectangle(width, height)
+        rect = self._get_video_display_rect(width, height)
+        fitted = self._clamp_region_to_video_area(region, rect)
+        left, top, size = self._region_to_rectangle(fitted, rect)
         if size <= 0:
             return False
         cr.set_source_rgba(*fill_rgba)
@@ -503,22 +612,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _fit_region_to_bounds(
         self, region: CropRegion, width: int, height: int
     ) -> CropRegion:
-        if width <= 0 or height <= 0:
-            return region.clamped()
-        min_dimension = float(min(width, height))
-        if min_dimension <= 0:
-            return region.clamped()
-        size_ratio = max(0.0, min(region.size, 1.0))
-        size_px = size_ratio * min_dimension
-        half = size_px / 2.0
-        center_x_px = region.center_x * width
-        center_y_px = region.center_y * height
-        center_x_px = max(half, min(center_x_px, width - half))
-        center_y_px = max(half, min(center_y_px, height - half))
-        center_x = center_x_px / width if width > 0 else 0.5
-        center_y = center_y_px / height if height > 0 else 0.5
-        normalized_size = size_px / min_dimension if min_dimension > 0 else 0.0
-        return CropRegion(center_x, center_y, normalized_size).clamped()
+        rect = self._get_video_display_rect(width, height)
+        return self._clamp_region_to_video_area(region, rect)
 
     def _translate_region_by_delta(
         self,
@@ -528,38 +623,34 @@ class PlayerWindow(Gtk.ApplicationWindow):
         width: int,
         height: int,
     ) -> CropRegion:
-        if width <= 0 or height <= 0:
-            return region
-        min_dimension = float(min(width, height))
+        rect = self._get_video_display_rect(width, height)
+        _offset_x, _offset_y, video_w, video_h = rect
+        if video_w <= 0 or video_h <= 0:
+            return region.clamped()
+        min_dimension = float(min(video_w, video_h))
         if min_dimension <= 0:
-            return region
+            return region.clamped()
         size_px = max(0.0, min(region.size, 1.0)) * min_dimension
         half = size_px / 2.0
-        center_x_px = region.center_x * width + dx
-        center_y_px = region.center_y * height + dy
-        center_x_px = max(half, min(center_x_px, width - half))
-        center_y_px = max(half, min(center_y_px, height - half))
-        center_x = center_x_px / width if width > 0 else region.center_x
-        center_y = center_y_px / height if height > 0 else region.center_y
-        normalized_size = size_px / min_dimension if min_dimension > 0 else region.size
-        return CropRegion(center_x, center_y, normalized_size).clamped()
+        center_x_px = region.center_x * video_w + dx
+        center_y_px = region.center_y * video_h + dy
+        center_x_px = max(half, min(center_x_px, video_w - half))
+        center_y_px = max(half, min(center_y_px, video_h - half))
+        normalized_size = size_px / min_dimension if min_dimension > 0 else 0.0
+        candidate = CropRegion(
+            center_x_px / video_w if video_w > 0 else region.center_x,
+            center_y_px / video_h if video_h > 0 else region.center_y,
+            normalized_size,
+        )
+        return self._clamp_region_to_video_area(candidate, rect)
 
     def _maximize_region(
         self, region: CropRegion, width: int, height: int
     ) -> CropRegion:
-        if width <= 0 or height <= 0:
-            return region
-        min_dimension = float(min(width, height))
-        if min_dimension <= 0:
-            return region
-        half = min_dimension / 2.0
-        center_x_px = region.center_x * width
-        center_y_px = region.center_y * height
-        center_x_px = max(half, min(center_x_px, width - half))
-        center_y_px = max(half, min(center_y_px, height - half))
-        center_x = center_x_px / width if width > 0 else 0.5
-        center_y = center_y_px / height if height > 0 else 0.5
-        return CropRegion(center_x, center_y, 1.0).clamped()
+        rect = self._get_video_display_rect(width, height)
+        return self._clamp_region_to_video_area(
+            CropRegion(region.center_x, region.center_y, 1.0), rect
+        )
 
     def _build_region_from_drag(
         self,
@@ -568,14 +659,20 @@ class PlayerWindow(Gtk.ApplicationWindow):
         width: int,
         height: int,
     ) -> CropRegion | None:
-        if width <= 0 or height <= 0:
+        rect = self._get_video_display_rect(width, height)
+        offset_x, offset_y, video_w, video_h = rect
+        if video_w <= 0 or video_h <= 0:
             return None
-        start_x = max(0.0, min(start[0], float(width)))
-        start_y = max(0.0, min(start[1], float(height)))
-        current_x = max(0.0, min(current[0], float(width)))
-        current_y = max(0.0, min(current[1], float(height)))
-        dx = current_x - start_x
-        dy = current_y - start_y
+        start_x = max(offset_x, min(start[0], offset_x + video_w))
+        start_y = max(offset_y, min(start[1], offset_y + video_h))
+        current_x = max(offset_x, min(current[0], offset_x + video_w))
+        current_y = max(offset_y, min(current[1], offset_y + video_h))
+        start_local_x = start_x - offset_x
+        start_local_y = start_y - offset_y
+        current_local_x = current_x - offset_x
+        current_local_y = current_y - offset_y
+        dx = current_local_x - start_local_x
+        dy = current_local_y - start_local_y
         abs_dx = abs(dx)
         abs_dy = abs(dy)
         if abs_dx == 0 and abs_dy == 0:
@@ -584,18 +681,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
             side = max(abs_dx, abs_dy)
         else:
             side = min(abs_dx, abs_dy)
-        min_dimension = float(min(width, height))
+        min_dimension = float(min(video_w, video_h))
         side = min(side, min_dimension)
         if side <= 0:
             return None
-        left = start_x if dx >= 0 else start_x - side
-        top = start_y if dy >= 0 else start_y - side
-        left = max(0.0, min(left, width - side))
-        top = max(0.0, min(top, height - side))
-        center_x = (left + side / 2.0) / width if width > 0 else 0.5
-        center_y = (top + side / 2.0) / height if height > 0 else 0.5
+        left = start_local_x if dx >= 0 else start_local_x - side
+        top = start_local_y if dy >= 0 else start_local_y - side
+        left = max(0.0, min(left, video_w - side))
+        top = max(0.0, min(top, video_h - side))
+        center_x = (left + side / 2.0) / video_w if video_w > 0 else 0.5
+        center_y = (top + side / 2.0) / video_h if video_h > 0 else 0.5
         size_ratio = side / min_dimension if min_dimension > 0 else 0.0
-        return CropRegion(center_x, center_y, size_ratio).clamped()
+        region = CropRegion(center_x, center_y, size_ratio).clamped()
+        return self._clamp_region_to_video_area(region, rect)
 
     def _on_crop_overlay_draw(self, widget: Gtk.DrawingArea, cr: cairo.Context) -> bool:
         allocation = widget.get_allocation()
@@ -663,6 +761,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return False
 
         if event.button == 1:
+            allocation = self._crop_overlay.get_allocation()
+            if not self._point_in_video_area(
+                event.x, event.y, allocation.width, allocation.height
+            ):
+                return False
             self._crop_dragging = True
             self._crop_drag_button = 1
             self._crop_drag_key = key
@@ -674,6 +777,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         if event.button == 3:
             if self._current_video_file is None:
+                return False
+            allocation = self._crop_overlay.get_allocation()
+            if not self._point_in_video_area(
+                event.x, event.y, allocation.width, allocation.height
+            ):
                 return False
             self._crop_dragging = True
             self._crop_drag_button = 3
