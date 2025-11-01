@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from dataclasses import dataclass
 from fractions import Fraction
@@ -23,6 +24,8 @@ else:
     _GST_PBUTILS_AVAILABLE = True
 
 from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
+
+from implicitdict import ImplicitDict
 
 if _GST_PBUTILS_AVAILABLE:
     try:
@@ -72,6 +75,22 @@ class CropRegion:
         left = max(offset_x, min(left, offset_x + width - size_px))
         top = max(offset_y, min(top, offset_y + height - size_px))
         return left, top, size_px
+
+
+class SquareCroppingPoint(ImplicitDict):
+    frame: int
+    u: int
+    v: int
+    size: int
+
+
+class SquareCroppingData(ImplicitDict):
+    in_point: SquareCroppingPoint
+    out_point: SquareCroppingPoint
+
+
+class VideoMetadata(ImplicitDict):
+    square_cropping: SquareCroppingData
 
 
 def _coerce_fraction(value: object) -> tuple[int, int] | None:
@@ -300,10 +319,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_initial_region: CropRegion | None = None
         self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
+        self._crop_region_dirty = False
         self._current_video_file: Path | None = None
         self._discoverer: GstPbutilsTypes.Discoverer | None = None  # type: ignore[attr-defined]
         self._discoverer_failed = not _GST_PBUTILS_AVAILABLE
         self._current_video_pixel_size: tuple[float, float] | None = None
+        self._current_video_frame_rate: tuple[int, int] | None = None
 
         self._load_video(self._current_index)
 
@@ -380,6 +401,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._current_video_file = video_file
         self._current_video_pixel_size = self._probe_video_size(video_file)
         self._ensure_crop_defaults(video_file)
+        self._crop_region_dirty = False
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
         self._title_label.set_text(video_file.name)
@@ -418,6 +440,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         return self._discoverer
 
     def _probe_video_size(self, video_file: Path) -> tuple[float, float] | None:
+        self._current_video_frame_rate = None
         discoverer = self._ensure_discoverer()
         if discoverer is not None and GstPbutils is not None:
             try:
@@ -437,6 +460,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
                     height = float(stream.get_height())
                     if width <= 0.0 or height <= 0.0:
                         continue
+                    fr_num = stream.get_framerate_num()
+                    fr_den = stream.get_framerate_den()
+                    if fr_num > 0 and fr_den > 0:
+                        self._current_video_frame_rate = (int(fr_num), int(fr_den))
                     par_num = stream.get_par_num()
                     par_den = stream.get_par_den()
                     if par_num > 0 and par_den > 0:
@@ -500,12 +527,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
             if width <= 0 or height <= 0:
                 return
             par = _structure_fraction(structure, "pixel-aspect-ratio")
+            fr = _structure_fraction(structure, "framerate")
             width_f = float(width)
             height_f = float(height)
             if par is not None:
                 par_num, par_den = par
                 if par_num > 0 and par_den > 0:
                     width_f *= par_num / par_den
+            if fr is not None:
+                fr_num, fr_den = fr
+                if fr_num > 0 and fr_den > 0:
+                    self._current_video_frame_rate = (fr_num, fr_den)
             result["size"] = (width_f, height_f)
             sink_pad = _sink.get_static_pad("sink")
             if sink_pad is not None and not sink_pad.is_linked():
@@ -652,12 +684,127 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return
         default_in = CropRegion(0.5, 0.5, 1.0)
         default_out = CropRegion(0.5, 0.5, 1.0)
-        self._video_crop_regions[video_file] = {"in": default_in, "out": default_out}
+        in_region = default_in
+        out_region = default_out
+        metadata = self._load_video_metadata(video_file)
+        if metadata is not None:
+            square_data = metadata.square_cropping
+            converted_in = self._square_point_to_crop_region(square_data.in_point)
+            if converted_in is not None:
+                in_region = converted_in
+            converted_out = self._square_point_to_crop_region(square_data.out_point)
+            if converted_out is not None:
+                out_region = converted_out
+
+        self._video_crop_regions[video_file] = {
+            "in": in_region.clamped(),
+            "out": out_region.clamped(),
+        }
 
     def _get_crop_region(self, video_file: Path, key: Literal["in", "out"]) -> CropRegion:
         self._ensure_crop_defaults(video_file)
         stored = self._video_crop_regions[video_file][key]
         return stored.clamped()
+
+    def _metadata_path(self, video_file: Path) -> Path:
+        return video_file.with_suffix(".json")
+
+    def _load_video_metadata(self, video_file: Path) -> VideoMetadata | None:
+        metadata_path = self._metadata_path(video_file)
+        if not metadata_path.exists():
+            return None
+        try:
+            with metadata_path.open("r", encoding="utf-8") as handle:
+                raw_metadata = json.load(handle)
+        except (OSError, json.JSONDecodeError) as exc:
+            print(
+                f"Failed to read metadata for '{video_file.name}': {exc}",
+                file=sys.stderr,
+            )
+            return None
+        try:
+            return ImplicitDict.parse(raw_metadata, VideoMetadata)
+        except (TypeError, ValueError) as exc:
+            print(
+                f"Metadata for '{video_file.name}' is invalid: {exc}",
+                file=sys.stderr,
+            )
+            return None
+
+    def _save_video_metadata(self, video_file: Path) -> None:
+        self._ensure_crop_defaults(video_file)
+        metadata_path = self._metadata_path(video_file)
+        in_region = self._video_crop_regions[video_file]["in"].clamped()
+        out_region = self._video_crop_regions[video_file]["out"].clamped()
+        metadata = VideoMetadata(
+            square_cropping=SquareCroppingData(
+                in_point=self._crop_region_to_square_point(in_region, self._trim_in_seconds),
+                out_point=self._crop_region_to_square_point(out_region, self._trim_out_seconds),
+            )
+        )
+        try:
+            with metadata_path.open("w", encoding="utf-8") as handle:
+                json.dump(metadata, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            self._crop_region_dirty = False
+        except OSError as exc:
+            print(
+                f"Failed to write metadata for '{video_file.name}': {exc}",
+                file=sys.stderr,
+            )
+
+    def _persist_metadata_for_current_video(self) -> None:
+        if self._current_video_file is None:
+            return
+        self._ensure_crop_defaults(self._current_video_file)
+        self._save_video_metadata(self._current_video_file)
+
+    def _crop_region_to_square_point(self, region: CropRegion, seconds: float) -> SquareCroppingPoint:
+        video_w, video_h = self._current_video_pixel_size or (0.0, 0.0)
+        min_dimension = min(video_w, video_h) if video_w > 0 and video_h > 0 else 0.0
+        u = int(round(region.center_x * video_w)) if video_w > 0 else 0
+        v = int(round(region.center_y * video_h)) if video_h > 0 else 0
+        size = int(round(region.size * min_dimension)) if min_dimension > 0 else 0
+        return SquareCroppingPoint(
+            frame=self._seconds_to_frame(seconds),
+            u=u,
+            v=v,
+            size=size,
+        )
+
+    def _square_point_to_crop_region(
+        self, point: SquareCroppingPoint
+    ) -> CropRegion | None:
+        video_size = self._current_video_pixel_size
+        if not video_size:
+            return None
+        video_w, video_h = video_size
+        if video_w <= 0 or video_h <= 0:
+            return None
+        u = point.u
+        v = point.v
+        size = point.size
+        if not isinstance(u, (int, float)) or not isinstance(v, (int, float)):
+            return None
+        if not isinstance(size, (int, float)):
+            return None
+        min_dimension = min(video_w, video_h)
+        if min_dimension <= 0:
+            return None
+        center_x = float(u) / video_w
+        center_y = float(v) / video_h
+        size_ratio = float(size) / min_dimension
+        return CropRegion(center_x, center_y, size_ratio).clamped()
+
+    def _seconds_to_frame(self, seconds: float) -> int:
+        rate = self._current_video_frame_rate
+        if rate is None:
+            return int(round(seconds * 1000.0))
+        num, den = rate
+        if num <= 0 or den <= 0:
+            return int(round(seconds * 1000.0))
+        fps = num / den
+        return int(round(seconds * fps))
 
     def _get_video_display_rect(
         self, width: int, height: int
@@ -720,6 +867,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         *,
         width: int | None = None,
         height: int | None = None,
+        persist: bool = True,
     ) -> None:
         if self._current_video_file is None:
             return
@@ -729,8 +877,21 @@ class PlayerWindow(Gtk.ApplicationWindow):
             width = allocation.width
             height = allocation.height
         fitted = self._fit_region_to_bounds(region, width or 0, height or 0)
-        self._video_crop_regions[self._current_video_file][key] = fitted.clamped()
+        updated = fitted.clamped()
+        current = self._video_crop_regions[self._current_video_file][key]
+        if (
+            abs(current.center_x - updated.center_x) <= self._crop_edit_tolerance
+            and abs(current.center_y - updated.center_y) <= self._crop_edit_tolerance
+            and abs(current.size - updated.size) <= self._crop_edit_tolerance
+        ):
+            if persist and self._crop_region_dirty:
+                self._persist_metadata_for_current_video()
+            return
+        self._video_crop_regions[self._current_video_file][key] = updated
+        self._crop_region_dirty = True
         self._crop_overlay.queue_draw()
+        if persist:
+            self._persist_metadata_for_current_video()
 
     def _interpolate_regions(self, start: CropRegion, end: CropRegion, t: float) -> CropRegion:
         t = max(0.0, min(1.0, t))
@@ -990,6 +1151,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 region,
                 width=width,
                 height=height,
+                persist=False,
             )
             return True
 
@@ -1120,6 +1282,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if event.button != 1:
             return False
         self._active_trim = None
+        self._persist_metadata_for_current_video()
         return True
 
     def _on_trim_motion(self, _widget: Gtk.Widget, event: Gdk.EventMotion) -> bool:
@@ -1147,6 +1310,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._pending_trim_reset = False
         self._trim_area.queue_draw()
         self._crop_overlay.queue_draw()
+        self._persist_metadata_for_current_video()
 
     def _on_set_out_clicked(self, _button: Gtk.Button) -> None:
         position = self._progress_adjustment.get_value()
@@ -1154,6 +1318,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._pending_trim_reset = False
         self._trim_area.queue_draw()
         self._crop_overlay.queue_draw()
+        self._persist_metadata_for_current_video()
 
     def _on_go_to_in_clicked(self, _button: Gtk.Button) -> None:
         self._seek_to_seconds(self._trim_in_seconds)
