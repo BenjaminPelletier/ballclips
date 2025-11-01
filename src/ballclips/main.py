@@ -687,18 +687,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         metadata = self._load_video_metadata(video_file)
         if metadata is not None:
             square_data = metadata.square_cropping
-            if isinstance(square_data, SquareCroppingPoint):
-                converted = self._square_point_to_crop_region(square_data)
-                if converted is not None:
-                    in_region = converted
-                    out_region = converted
-            else:
-                converted_in = self._square_point_to_crop_region(square_data.in_point)
-                if converted_in is not None:
-                    in_region = converted_in
-                converted_out = self._square_point_to_crop_region(square_data.out_point)
-                if converted_out is not None:
-                    out_region = converted_out
+            converted_in = self._square_point_to_crop_region(square_data.in_point)
+            if converted_in is not None:
+                in_region = converted_in
+            converted_out = self._square_point_to_crop_region(square_data.out_point)
+            if converted_out is not None:
+                out_region = converted_out
 
         self._video_crop_regions[video_file] = {
             "in": in_region.clamped(),
