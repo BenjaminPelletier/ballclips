@@ -46,14 +46,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._player is None:
             raise RuntimeError("Unable to create GStreamer playbin element.")
 
-        sink = Gst.ElementFactory.make("gtksink", "video_sink")
-        if sink is None:
-            raise RuntimeError(
-                "The 'gtksink' plugin is required. Install the GStreamer GTK plugin package."
-            )
+        sink, video_widget = self._create_video_sink()
 
         self._player.set_property("video-sink", sink)
-        video_widget = sink.props.widget
         video_widget.set_hexpand(True)
         video_widget.set_vexpand(True)
 
@@ -169,6 +164,25 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._pending_trim_reset = True
 
         self._load_video(self._current_index)
+
+    def _create_video_sink(self) -> tuple[Gst.Element, Gtk.Widget]:
+        """Choose a GTK sink that keeps frames on the GPU when possible."""
+
+        # Prefer gtkglsink because it hands frames to GTK through an OpenGL-backed
+        # widget, avoiding the CPU read-backs that make high-bitrate clips stall in
+        # virtualised environments.  If that plugin is unavailable we fall back to
+        # gtksink so the UI remains functional.
+        for name in ("gtkglsink", "gtksink"):
+            sink = Gst.ElementFactory.make(name, f"video_sink_{name}")
+            if sink is None:
+                continue
+            widget = getattr(sink.props, "widget", None)
+            if isinstance(widget, Gtk.Widget):
+                return sink, widget
+
+        raise RuntimeError(
+            "No suitable GTK video sink is available. Install the GStreamer GTK plugins."
+        )
 
     def _load_video(self, index: int) -> None:
         if not self._video_files:
