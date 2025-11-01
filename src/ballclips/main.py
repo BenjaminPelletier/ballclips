@@ -99,25 +99,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         progress_scale.set_draw_value(False)
         progress_scale.connect("value-changed", self._on_progress_changed)
 
-        set_in_button = Gtk.Button(label="{")
-        set_in_button.connect("clicked", self._on_set_in_clicked)
-
         goto_in_button = Gtk.Button(label="→{")
         goto_in_button.connect("clicked", self._on_go_to_in_clicked)
 
-        set_in_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        set_in_column.pack_start(goto_in_button, False, False, 0)
-        set_in_column.pack_start(set_in_button, False, False, 0)
+        set_in_button = Gtk.Button(label="{")
+        set_in_button.connect("clicked", self._on_set_in_clicked)
 
         set_out_button = Gtk.Button(label="}")
         set_out_button.connect("clicked", self._on_set_out_clicked)
 
         goto_out_button = Gtk.Button(label="→}")
         goto_out_button.connect("clicked", self._on_go_to_out_clicked)
-
-        set_out_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        set_out_column.pack_start(goto_out_button, False, False, 0)
-        set_out_column.pack_start(set_out_button, False, False, 0)
 
         trim_area = Gtk.DrawingArea()
         trim_area.set_hexpand(True)
@@ -137,24 +129,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         timeline_grid.set_column_spacing(6)
         timeline_grid.set_hexpand(True)
 
-        left_spacer = Gtk.Box()
-        right_spacer = Gtk.Box()
-
-        timeline_grid.attach(left_spacer, 0, 0, 1, 1)
+        timeline_grid.attach(goto_in_button, 0, 0, 1, 1)
         timeline_grid.attach(progress_scale, 1, 0, 1, 1)
-        timeline_grid.attach(right_spacer, 2, 0, 1, 1)
+        timeline_grid.attach(goto_out_button, 2, 0, 1, 1)
 
-        timeline_grid.attach(set_in_column, 0, 1, 1, 1)
+        timeline_grid.attach(set_in_button, 0, 1, 1, 1)
         timeline_grid.attach(trim_area, 1, 1, 1, 1)
-        timeline_grid.attach(set_out_column, 2, 1, 1, 1)
+        timeline_grid.attach(set_out_button, 2, 1, 1, 1)
 
-        left_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
-        left_group.add_widget(left_spacer)
-        left_group.add_widget(set_in_button)
-
-        right_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
-        right_group.add_widget(right_spacer)
-        right_group.add_widget(set_out_button)
+        button_width_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
+        button_width_group.add_widget(goto_in_button)
+        button_width_group.add_widget(set_in_button)
+        button_width_group.add_widget(goto_out_button)
+        button_width_group.add_widget(set_out_button)
 
         controls.pack_start(timeline_grid, True, True, 0)
 
