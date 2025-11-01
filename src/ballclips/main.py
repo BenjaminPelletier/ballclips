@@ -46,14 +46,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._player is None:
             raise RuntimeError("Unable to create GStreamer playbin element.")
 
-        sink = Gst.ElementFactory.make("gtksink", "video_sink")
-        if sink is None:
-            raise RuntimeError(
-                "The 'gtksink' plugin is required. Install the GStreamer GTK plugin package."
-            )
+        sink, video_widget = self._create_video_sink()
 
         self._player.set_property("video-sink", sink)
-        video_widget = sink.props.widget
         video_widget.set_hexpand(True)
         video_widget.set_vexpand(True)
 
@@ -169,6 +164,70 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._pending_trim_reset = True
 
         self._load_video(self._current_index)
+
+    def _create_video_sink(self) -> tuple[Gst.Element, Gtk.Widget]:
+        """Choose a GTK sink that keeps frames on the GPU when possible."""
+
+        # Prefer a GL-backed sink so the video can be rendered by the GPU when
+        # available, but wrap it in glsinkbin so software decoders can still
+        # negotiate with a conventional video/x-raw surface.  If the GL stack is
+        # missing we fall back to gtksink so playback keeps working everywhere.
+
+        failure_reasons: list[str] = []
+
+        def _build_gtkglsink() -> tuple[Gst.Element, Gtk.Widget] | None:
+            gtkgl = Gst.ElementFactory.make("gtkglsink", "gtkglsink")
+            if gtkgl is None:
+                failure_reasons.append(
+                    "gtkglsink plugin is unavailable. Install the GStreamer GL/gtk plugins (e.g. gst-plugins-bad) and ensure the VM has 3D acceleration enabled."
+                )
+                return None
+            widget = getattr(gtkgl.props, "widget", None)
+            if not isinstance(widget, Gtk.Widget):
+                failure_reasons.append(
+                    "gtkglsink did not expose a Gtk.Widget. Verify gstreamer1.0-gtk3 is installed and up to date."
+                )
+                return None
+
+            glbin = Gst.ElementFactory.make("glsinkbin", "gtkglsink_bin")
+            if glbin is None:
+                failure_reasons.append(
+                    "glsinkbin plugin is unavailable. Install the GStreamer GL plugins to enable GPU-backed rendering."
+                )
+                return None
+            glbin.set_property("sink", gtkgl)
+            return glbin, widget
+
+        builders = (_build_gtkglsink,)
+        for build in builders:
+            result = build()
+            if result is not None:
+                return result
+
+        # Fallback: CPU-bound GTK sink.
+        gtksink = Gst.ElementFactory.make("gtksink", "gtksink")
+        if gtksink is not None:
+            widget = getattr(gtksink.props, "widget", None)
+            if isinstance(widget, Gtk.Widget):
+                if not failure_reasons:
+                    failure_reasons.append(
+                        "gtkglsink could not be initialised for an unknown reason. Check that gstreamer1.0-plugins-bad and gstreamer1.0-gtk3 are installed."
+                    )
+                reason_text = "\n".join(f"- {reason}" for reason in failure_reasons)
+                print(
+                    "Using CPU-bound gtksink for video playback. Expect higher CPU usage and possible stuttering compared to VLC, which can keep frames on the GPU.\n"
+                    "Diagnostic hints:\n"
+                    f"{reason_text}\n"
+                    "If you are running inside VirtualBox, double-check that Guest Additions and 3D acceleration are active.",
+                    file=sys.stderr,
+                )
+                return gtksink, widget
+
+        hint = "; ".join(failure_reasons) if failure_reasons else "unknown reason"
+        raise RuntimeError(
+            "No suitable GTK video sink is available. Install the GStreamer GTK plugins."
+            f" ({hint})"
+        )
 
     def _load_video(self, index: int) -> None:
         if not self._video_files:
