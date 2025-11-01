@@ -138,6 +138,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         play_pause_button.connect("clicked", self._on_play_pause_clicked)
         play_column.pack_start(play_pause_button, False, False, 0)
 
+        maximize_button = Gtk.Button(label="✥")
+        maximize_button.connect("clicked", self._on_maximize_crop_clicked)
+        play_column.pack_start(maximize_button, False, False, 0)
+
         progress_adjustment = Gtk.Adjustment(0.0, 0.0, 1.0, 0.1, 1.0, 0.0)
         progress_scale = Gtk.Scale.new(Gtk.Orientation.HORIZONTAL, progress_adjustment)
         progress_scale.set_hexpand(True)
@@ -190,21 +194,6 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         controls.pack_start(timeline_grid, True, True, 0)
 
-        crop_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        crop_label = Gtk.Label(label="Crop region")
-        crop_label.set_halign(Gtk.Align.START)
-        crop_controls.pack_start(crop_label, False, False, 0)
-
-        crop_in_button = Gtk.ToggleButton(label="in {")
-        crop_in_button.connect("toggled", self._on_crop_edit_toggled, "in")
-        crop_controls.pack_start(crop_in_button, False, False, 0)
-
-        crop_out_button = Gtk.ToggleButton(label="out }")
-        crop_out_button.connect("toggled", self._on_crop_edit_toggled, "out")
-        crop_controls.pack_start(crop_out_button, False, False, 0)
-
-        controls.pack_start(crop_controls, False, False, 0)
-
         container.pack_start(controls, False, False, 0)
         self.add(container)
         self.show_all()
@@ -227,13 +216,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._trim_out_seconds = 0.0
         self._active_trim: Literal["in", "out"] | None = None
         self._pending_trim_reset = True
+
         self._crop_overlay = crop_overlay
-        self._crop_in_button = crop_in_button
-        self._crop_out_button = crop_out_button
-        self._crop_edit_mode: Literal["in", "out"] | None = None
         self._crop_dragging = False
+        self._crop_drag_button: int | None = None
         self._crop_drag_start: tuple[float, float] | None = None
         self._crop_drag_current: tuple[float, float] | None = None
+        self._crop_drag_key: Literal["in", "out"] | None = None
+        self._crop_initial_region: CropRegion | None = None
+        self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
         self._current_video_file: Path | None = None
 
@@ -356,6 +347,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._is_playing = target_state == Gst.State.PLAYING
         self._update_play_pause_icon()
 
+    def _on_maximize_crop_clicked(self, _button: Gtk.Button) -> None:
+        key = self._determine_active_crop_key()
+        if key is None or self._current_video_file is None:
+            return
+        allocation = self._crop_overlay.get_allocation()
+        width = allocation.width
+        height = allocation.height
+        if width <= 0 or height <= 0:
+            return
+        region = self._get_crop_region(self._current_video_file, key)
+        expanded = self._maximize_region(region, width, height)
+        self._set_crop_region(key, expanded, width=width, height=height)
+
     def _update_play_pause_icon(self) -> None:
         icon_name = "media-playback-pause" if self._is_playing else "media-playback-start"
         self._play_pause_button.set_image(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
@@ -439,11 +443,23 @@ class PlayerWindow(Gtk.ApplicationWindow):
         stored = self._video_crop_regions[video_file][key]
         return stored.clamped()
 
-    def _set_crop_region(self, key: Literal["in", "out"], region: CropRegion) -> None:
+    def _set_crop_region(
+        self,
+        key: Literal["in", "out"],
+        region: CropRegion,
+        *,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
         if self._current_video_file is None:
             return
         self._ensure_crop_defaults(self._current_video_file)
-        self._video_crop_regions[self._current_video_file][key] = region.clamped()
+        if width is None or height is None:
+            allocation = self._crop_overlay.get_allocation()
+            width = allocation.width
+            height = allocation.height
+        fitted = self._fit_region_to_bounds(region, width or 0, height or 0)
+        self._video_crop_regions[self._current_video_file][key] = fitted.clamped()
         self._crop_overlay.queue_draw()
 
     def _interpolate_regions(self, start: CropRegion, end: CropRegion, t: float) -> CropRegion:
@@ -473,6 +489,77 @@ class PlayerWindow(Gtk.ApplicationWindow):
         cr.set_line_width(2.0)
         cr.stroke()
         return True
+
+    def _determine_active_crop_key(self) -> Literal["in", "out"] | None:
+        if self._current_video_file is None:
+            return None
+        position = self._progress_adjustment.get_value()
+        if abs(position - self._trim_in_seconds) <= self._crop_edit_tolerance:
+            return "in"
+        if abs(position - self._trim_out_seconds) <= self._crop_edit_tolerance:
+            return "out"
+        return None
+
+    def _fit_region_to_bounds(
+        self, region: CropRegion, width: int, height: int
+    ) -> CropRegion:
+        if width <= 0 or height <= 0:
+            return region.clamped()
+        min_dimension = float(min(width, height))
+        if min_dimension <= 0:
+            return region.clamped()
+        size_ratio = max(0.0, min(region.size, 1.0))
+        size_px = size_ratio * min_dimension
+        half = size_px / 2.0
+        center_x_px = region.center_x * width
+        center_y_px = region.center_y * height
+        center_x_px = max(half, min(center_x_px, width - half))
+        center_y_px = max(half, min(center_y_px, height - half))
+        center_x = center_x_px / width if width > 0 else 0.5
+        center_y = center_y_px / height if height > 0 else 0.5
+        normalized_size = size_px / min_dimension if min_dimension > 0 else 0.0
+        return CropRegion(center_x, center_y, normalized_size).clamped()
+
+    def _translate_region_by_delta(
+        self,
+        region: CropRegion,
+        dx: float,
+        dy: float,
+        width: int,
+        height: int,
+    ) -> CropRegion:
+        if width <= 0 or height <= 0:
+            return region
+        min_dimension = float(min(width, height))
+        if min_dimension <= 0:
+            return region
+        size_px = max(0.0, min(region.size, 1.0)) * min_dimension
+        half = size_px / 2.0
+        center_x_px = region.center_x * width + dx
+        center_y_px = region.center_y * height + dy
+        center_x_px = max(half, min(center_x_px, width - half))
+        center_y_px = max(half, min(center_y_px, height - half))
+        center_x = center_x_px / width if width > 0 else region.center_x
+        center_y = center_y_px / height if height > 0 else region.center_y
+        normalized_size = size_px / min_dimension if min_dimension > 0 else region.size
+        return CropRegion(center_x, center_y, normalized_size).clamped()
+
+    def _maximize_region(
+        self, region: CropRegion, width: int, height: int
+    ) -> CropRegion:
+        if width <= 0 or height <= 0:
+            return region
+        min_dimension = float(min(width, height))
+        if min_dimension <= 0:
+            return region
+        half = min_dimension / 2.0
+        center_x_px = region.center_x * width
+        center_y_px = region.center_y * height
+        center_x_px = max(half, min(center_x_px, width - half))
+        center_y_px = max(half, min(center_y_px, height - half))
+        center_x = center_x_px / width if width > 0 else 0.5
+        center_y = center_y_px / height if height > 0 else 0.5
+        return CropRegion(center_x, center_y, 1.0).clamped()
 
     def _build_region_from_drag(
         self,
@@ -517,7 +604,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if width <= 0 or height <= 0:
             return False
 
-        if self._crop_dragging and self._crop_drag_start and self._crop_drag_current:
+        if (
+            self._crop_dragging
+            and self._crop_drag_button == 1
+            and self._crop_drag_start
+            and self._crop_drag_current
+        ):
             preview = self._build_region_from_drag(
                 self._crop_drag_start,
                 self._crop_drag_current,
@@ -565,45 +657,87 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
         return False
 
-    def _on_crop_edit_toggled(
-        self, button: Gtk.ToggleButton, key: Literal["in", "out"]
-    ) -> None:
-        if button.get_active():
-            if key == "in" and self._crop_out_button.get_active():
-                self._crop_out_button.set_active(False)
-            elif key == "out" and self._crop_in_button.get_active():
-                self._crop_in_button.set_active(False)
-            self._crop_edit_mode = key
-        else:
-            if self._crop_edit_mode == key:
-                self._crop_edit_mode = None
-        if not button.get_active():
-            self._crop_dragging = False
-        self._crop_overlay.queue_draw()
-
     def _on_crop_button_press(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
-        if event.button != 1 or self._crop_edit_mode is None:
+        key = self._determine_active_crop_key()
+        if key is None:
             return False
-        self._crop_dragging = True
-        self._crop_drag_start = (event.x, event.y)
-        self._crop_drag_current = (event.x, event.y)
-        self._crop_overlay.queue_draw()
-        return True
+
+        if event.button == 1:
+            self._crop_dragging = True
+            self._crop_drag_button = 1
+            self._crop_drag_key = key
+            self._crop_drag_start = (event.x, event.y)
+            self._crop_drag_current = (event.x, event.y)
+            self._crop_initial_region = None
+            self._crop_overlay.queue_draw()
+            return True
+
+        if event.button == 3:
+            if self._current_video_file is None:
+                return False
+            self._crop_dragging = True
+            self._crop_drag_button = 3
+            self._crop_drag_key = key
+            self._crop_drag_start = (event.x, event.y)
+            self._crop_drag_current = (event.x, event.y)
+            region = self._get_crop_region(self._current_video_file, key)
+            allocation = self._crop_overlay.get_allocation()
+            self._crop_initial_region = self._fit_region_to_bounds(
+                region,
+                allocation.width,
+                allocation.height,
+            )
+            return True
+
+        return False
 
     def _on_crop_motion(self, _widget: Gtk.Widget, event: Gdk.EventMotion) -> bool:
-        if not self._crop_dragging or self._crop_drag_start is None:
+        if (
+            not self._crop_dragging
+            or self._crop_drag_start is None
+            or self._crop_drag_key is None
+        ):
             return False
-        self._crop_drag_current = (event.x, event.y)
-        self._crop_overlay.queue_draw()
-        return True
 
-    def _on_crop_button_release(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
-        if event.button != 1 or not self._crop_dragging or self._crop_drag_start is None:
-            return False
         allocation = self._crop_overlay.get_allocation()
         width = allocation.width
         height = allocation.height
-        if self._crop_edit_mode is not None:
+
+        if self._crop_drag_button == 1:
+            self._crop_drag_current = (event.x, event.y)
+            self._crop_overlay.queue_draw()
+            return True
+
+        if self._crop_drag_button == 3 and self._crop_initial_region is not None:
+            dx = event.x - self._crop_drag_start[0]
+            dy = event.y - self._crop_drag_start[1]
+            region = self._translate_region_by_delta(
+                self._crop_initial_region, dx, dy, width, height
+            )
+            self._set_crop_region(
+                self._crop_drag_key,
+                region,
+                width=width,
+                height=height,
+            )
+            return True
+
+        return False
+
+    def _on_crop_button_release(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if (
+            not self._crop_dragging
+            or self._crop_drag_start is None
+            or self._crop_drag_key is None
+            or event.button != self._crop_drag_button
+        ):
+            return False
+
+        allocation = self._crop_overlay.get_allocation()
+        width = allocation.width
+        height = allocation.height
+
+        if self._crop_drag_button == 1:
             region = self._build_region_from_drag(
                 self._crop_drag_start,
                 (event.x, event.y),
@@ -611,10 +745,31 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 height,
             )
             if region is not None:
-                self._set_crop_region(self._crop_edit_mode, region)
+                self._set_crop_region(
+                    self._crop_drag_key,
+                    region,
+                    width=width,
+                    height=height,
+                )
+        elif self._crop_drag_button == 3 and self._crop_initial_region is not None:
+            dx = event.x - self._crop_drag_start[0]
+            dy = event.y - self._crop_drag_start[1]
+            region = self._translate_region_by_delta(
+                self._crop_initial_region, dx, dy, width, height
+            )
+            self._set_crop_region(
+                self._crop_drag_key,
+                region,
+                width=width,
+                height=height,
+            )
+
         self._crop_dragging = False
+        self._crop_drag_button = None
+        self._crop_drag_key = None
         self._crop_drag_start = None
         self._crop_drag_current = None
+        self._crop_initial_region = None
         self._crop_overlay.queue_draw()
         return True
 
