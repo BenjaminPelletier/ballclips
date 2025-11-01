@@ -5,14 +5,14 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Sequence
+from typing import Literal, Sequence
 
 import gi
 
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
 
-from gi.repository import GLib, Gst, Gtk, Pango
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
 
 
 def _list_mp4_files(folder: Path) -> list[Path]:
@@ -83,18 +83,48 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
+        button_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        controls.pack_start(button_column, False, False, 0)
+
         play_pause_button = Gtk.Button.new_from_icon_name(
             "media-playback-pause", Gtk.IconSize.BUTTON
         )
         play_pause_button.connect("clicked", self._on_play_pause_clicked)
-        controls.pack_start(play_pause_button, False, False, 0)
+        button_column.pack_start(play_pause_button, False, False, 0)
+
+        set_in_button = Gtk.Button(label="{")
+        set_in_button.connect("clicked", self._on_set_in_clicked)
+        button_column.pack_start(set_in_button, False, False, 0)
+
+        set_out_button = Gtk.Button(label="}")
+        set_out_button.connect("clicked", self._on_set_out_clicked)
+        button_column.pack_start(set_out_button, False, False, 0)
 
         progress_adjustment = Gtk.Adjustment(0.0, 0.0, 1.0, 0.1, 1.0, 0.0)
         progress_scale = Gtk.Scale.new(Gtk.Orientation.HORIZONTAL, progress_adjustment)
         progress_scale.set_hexpand(True)
         progress_scale.set_draw_value(False)
         progress_scale.connect("value-changed", self._on_progress_changed)
-        controls.pack_start(progress_scale, True, True, 0)
+
+        timeline_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        timeline_column.set_hexpand(True)
+        timeline_column.pack_start(progress_scale, False, False, 0)
+
+        trim_area = Gtk.DrawingArea()
+        trim_area.set_hexpand(True)
+        trim_area.set_size_request(-1, 30)
+        trim_area.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+        )
+        trim_area.connect("draw", self._on_trim_area_draw)
+        trim_area.connect("button-press-event", self._on_trim_button_press)
+        trim_area.connect("button-release-event", self._on_trim_button_release)
+        trim_area.connect("motion-notify-event", self._on_trim_motion)
+        timeline_column.pack_start(trim_area, False, False, 0)
+
+        controls.pack_start(timeline_column, True, True, 0)
 
         container.pack_start(controls, False, False, 0)
         self.add(container)
@@ -109,10 +139,15 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._play_pause_button = play_pause_button
         self._progress_adjustment = progress_adjustment
         self._progress_scale = progress_scale
+        self._trim_area = trim_area
         self._duration_ns = 0
         self._updating_progress = False
         self._is_playing = True
         self._progress_update_id = GLib.timeout_add(200, self._update_progress)
+        self._trim_in_seconds = 0.0
+        self._trim_out_seconds = 0.0
+        self._active_trim: Literal["in", "out"] | None = None
+        self._pending_trim_reset = True
 
         self._load_video(self._current_index)
 
@@ -135,6 +170,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._duration_ns = 0
         self._progress_adjustment.set_upper(1.0)
         self._set_progress_value(0.0)
+        self._trim_in_seconds = 0.0
+        self._trim_out_seconds = 0.0
+        self._pending_trim_reset = True
+        self._trim_area.queue_draw()
 
         self._app.set_current_index(self._current_index)
 
@@ -182,6 +221,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if success and duration_ns > 0 and duration_ns != self._duration_ns:
             self._duration_ns = duration_ns
             self._progress_adjustment.set_upper(duration_ns / Gst.SECOND)
+            self._reset_trims_if_needed()
+            self._trim_area.queue_draw()
 
         success, position_ns = self._player.query_position(Gst.Format.TIME)
         if success and self._duration_ns > 0:
@@ -199,6 +240,129 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _on_next_clicked(self, _button: Gtk.Button) -> None:
         self._load_video(self._current_index + 1)
+
+    def _reset_trims_if_needed(self) -> None:
+        duration_seconds = self._progress_adjustment.get_upper()
+        if duration_seconds <= 0:
+            return
+
+        if self._pending_trim_reset or self._trim_out_seconds <= 0:
+            self._trim_in_seconds = 0.0
+            self._trim_out_seconds = duration_seconds
+            self._pending_trim_reset = False
+        else:
+            self._trim_in_seconds = max(0.0, min(self._trim_in_seconds, duration_seconds))
+            self._trim_out_seconds = max(
+                self._trim_in_seconds, min(self._trim_out_seconds, duration_seconds)
+            )
+
+    def _on_trim_area_draw(self, _widget: Gtk.DrawingArea, cr: cairo.Context) -> bool:
+        allocation = self._trim_area.get_allocation()
+        width = allocation.width
+        height = allocation.height
+
+        cr.set_source_rgb(0.15, 0.15, 0.15)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+
+        duration_seconds = max(self._progress_adjustment.get_upper(), 0.0)
+        if duration_seconds <= 0 or width <= 0:
+            return False
+
+        in_x = self._seconds_to_x(self._trim_in_seconds, duration_seconds, width)
+        out_x = self._seconds_to_x(self._trim_out_seconds, duration_seconds, width)
+
+        cr.set_source_rgba(0.0, 1.0, 1.0, 0.3)
+        cr.rectangle(in_x, 0, max(out_x - in_x, 0.0), height)
+        cr.fill()
+
+        self._draw_brace(cr, in_x, height, (0.0, 0.8, 0.0), 1)
+        self._draw_brace(cr, out_x, height, (0.8, 0.0, 0.0), -1)
+
+        return False
+
+    def _draw_brace(
+        self,
+        cr: cairo.Context,
+        x: float,
+        height: int,
+        color: tuple[float, float, float],
+        direction: int,
+    ) -> None:
+        cr.set_source_rgb(*color)
+        brace_width = 6.0 * direction
+        cr.set_line_width(2.0)
+        cr.move_to(x, 0)
+        cr.line_to(x, height)
+        cr.move_to(x, 0)
+        cr.line_to(x + brace_width, 0)
+        cr.move_to(x, height)
+        cr.line_to(x + brace_width, height)
+        cr.stroke()
+
+    def _seconds_to_x(self, value: float, duration: float, width: int) -> float:
+        return max(0.0, min(width, (value / duration) * width))
+
+    def _x_to_seconds(self, x: float, duration: float, width: int) -> float:
+        if width <= 0:
+            return 0.0
+        return max(0.0, min(duration, (x / width) * duration))
+
+    def _on_trim_button_press(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button != 1:
+            return False
+
+        duration_seconds = self._progress_adjustment.get_upper()
+        allocation = self._trim_area.get_allocation()
+        width = allocation.width
+        in_x = self._seconds_to_x(self._trim_in_seconds, duration_seconds, width)
+        out_x = self._seconds_to_x(self._trim_out_seconds, duration_seconds, width)
+        tolerance = 8.0
+
+        if abs(event.x - in_x) <= tolerance:
+            self._active_trim = "in"
+            return True
+        if abs(event.x - out_x) <= tolerance:
+            self._active_trim = "out"
+            return True
+
+        return False
+
+    def _on_trim_button_release(self, _widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button != 1:
+            return False
+        self._active_trim = None
+        return True
+
+    def _on_trim_motion(self, _widget: Gtk.Widget, event: Gdk.EventMotion) -> bool:
+        if self._active_trim is None:
+            return False
+
+        duration_seconds = self._progress_adjustment.get_upper()
+        allocation = self._trim_area.get_allocation()
+        width = allocation.width
+        value = self._x_to_seconds(event.x, duration_seconds, width)
+
+        if self._active_trim == "in":
+            self._trim_in_seconds = min(value, self._trim_out_seconds)
+        else:
+            self._trim_out_seconds = max(value, self._trim_in_seconds)
+
+        self._pending_trim_reset = False
+        self._trim_area.queue_draw()
+        return True
+
+    def _on_set_in_clicked(self, _button: Gtk.Button) -> None:
+        position = self._progress_adjustment.get_value()
+        self._trim_in_seconds = min(position, self._trim_out_seconds)
+        self._pending_trim_reset = False
+        self._trim_area.queue_draw()
+
+    def _on_set_out_clicked(self, _button: Gtk.Button) -> None:
+        position = self._progress_adjustment.get_value()
+        self._trim_out_seconds = max(position, self._trim_in_seconds)
+        self._pending_trim_reset = False
+        self._trim_area.queue_draw()
 
 
 class BallclipsApplication(Gtk.Application):
