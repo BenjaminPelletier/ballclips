@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "PyGObject>=3.42",
+    "implicitdict>=1.0.0",
 ]
 
 [build-system]
