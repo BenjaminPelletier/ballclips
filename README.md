@@ -9,7 +9,7 @@ Batch video trimming, cropping tool, and composing tool for crystal ball video p
 * GStreamer 1.0 with the `gtksink` plugin (commonly available via `gstreamer1.0-plugins-good`).
 * GTK 3 and the PyGObject introspection bindings.
 
-```shell
+```bash
 sudo apt install -y \
   pkg-config \
   libcairo2-dev \
@@ -23,16 +23,31 @@ sudo apt install -y \
   gstreamer1.0-plugins-base \
   gstreamer1.0-plugins-good \
   gstreamer1.0-plugins-bad \
-  gstreamer1.0-plugins-ugly
+  gstreamer1.0-plugins-ugly \
+  gstreamer1.0-vaapi \
+  gstreamer1.0-libav
 ```
 
-## Running the prototype
+When using inside a VM:
+
+```bash
+sudo apt install -y \
+  vainfo \
+  mesa-va-drivers
+```
+
+## Running the tool
 
 Place one or more `.mp4` files in a folder and run:
 
 ```bash
-uv run ballclips <path-to-folder>
+uv run ballclips <path-to-folder-with-videos>
 ```
 
-The application will open a GTK window that plays the first MP4 file found in the
-specified folder. If no folder is given, the current working directory is used.
+To improve performance:
+
+```bash
+sudo nice -n -5 "$(command -v uv)" run ballclips ~/shared
+```
+
+To debug video behavior, `export GST_DEBUG=3`.
