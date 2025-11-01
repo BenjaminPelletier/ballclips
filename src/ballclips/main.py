@@ -12,7 +12,7 @@ import gi
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gst", "1.0")
 
-from gi.repository import Gst, Gtk, Pango
+from gi.repository import GLib, Gst, Gtk, Pango
 
 
 def _list_mp4_files(folder: Path) -> list[Path]:
@@ -80,6 +80,23 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         container.pack_start(header, False, False, 0)
         container.pack_start(video_widget, True, True, 0)
+
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+        play_pause_button = Gtk.Button.new_from_icon_name(
+            "media-playback-pause", Gtk.IconSize.BUTTON
+        )
+        play_pause_button.connect("clicked", self._on_play_pause_clicked)
+        controls.pack_start(play_pause_button, False, False, 0)
+
+        progress_adjustment = Gtk.Adjustment(0.0, 0.0, 1.0, 0.1, 1.0, 0.0)
+        progress_scale = Gtk.Scale.new(Gtk.Orientation.HORIZONTAL, progress_adjustment)
+        progress_scale.set_hexpand(True)
+        progress_scale.set_draw_value(False)
+        progress_scale.connect("value-changed", self._on_progress_changed)
+        controls.pack_start(progress_scale, True, True, 0)
+
+        container.pack_start(controls, False, False, 0)
         self.add(container)
         self.show_all()
 
@@ -88,6 +105,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         bus = self._player.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
+
+        self._play_pause_button = play_pause_button
+        self._progress_adjustment = progress_adjustment
+        self._progress_scale = progress_scale
+        self._duration_ns = 0
+        self._updating_progress = False
+        self._is_playing = True
+        self._progress_update_id = GLib.timeout_add(200, self._update_progress)
 
         self._load_video(self._current_index)
 
@@ -105,10 +130,19 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._player.set_property("uri", uri)
         self._player.set_state(Gst.State.PLAYING)
 
+        self._is_playing = True
+        self._update_play_pause_icon()
+        self._duration_ns = 0
+        self._progress_adjustment.set_upper(1.0)
+        self._set_progress_value(0.0)
+
         self._app.set_current_index(self._current_index)
 
     def _on_destroy(self, *_args: object) -> None:
         self._player.set_state(Gst.State.NULL)
+        if self._progress_update_id is not None:
+            GLib.source_remove(self._progress_update_id)
+            self._progress_update_id = None
 
     def _on_bus_message(self, _bus: Gst.Bus, message: Gst.Message) -> None:
         message_type = message.type
@@ -121,6 +155,44 @@ class PlayerWindow(Gtk.ApplicationWindow):
         elif message_type == Gst.MessageType.EOS:
             # Restart playback when the video finishes to keep the preview running.
             self._player.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH, 0)
+
+    def _on_play_pause_clicked(self, _button: Gtk.Button) -> None:
+        target_state = Gst.State.PAUSED if self._is_playing else Gst.State.PLAYING
+        self._player.set_state(target_state)
+        self._is_playing = target_state == Gst.State.PLAYING
+        self._update_play_pause_icon()
+
+    def _update_play_pause_icon(self) -> None:
+        icon_name = "media-playback-pause" if self._is_playing else "media-playback-start"
+        self._play_pause_button.set_image(Gtk.Image.new_from_icon_name(icon_name, Gtk.IconSize.BUTTON))
+
+    def _on_progress_changed(self, _scale: Gtk.Scale) -> None:
+        if self._updating_progress:
+            return
+        value_seconds = self._progress_adjustment.get_value()
+        position_ns = int(value_seconds * Gst.SECOND)
+        self._player.seek_simple(
+            Gst.Format.TIME,
+            Gst.SeekFlags.FLUSH | Gst.SeekFlags.ACCURATE,
+            position_ns,
+        )
+
+    def _update_progress(self) -> bool:
+        success, duration_ns = self._player.query_duration(Gst.Format.TIME)
+        if success and duration_ns > 0 and duration_ns != self._duration_ns:
+            self._duration_ns = duration_ns
+            self._progress_adjustment.set_upper(duration_ns / Gst.SECOND)
+
+        success, position_ns = self._player.query_position(Gst.Format.TIME)
+        if success and self._duration_ns > 0:
+            self._set_progress_value(position_ns / Gst.SECOND)
+
+        return True
+
+    def _set_progress_value(self, value_seconds: float) -> None:
+        self._updating_progress = True
+        self._progress_adjustment.set_value(value_seconds)
+        self._updating_progress = False
 
     def _on_prev_clicked(self, _button: Gtk.Button) -> None:
         self._load_video(self._current_index - 1)
