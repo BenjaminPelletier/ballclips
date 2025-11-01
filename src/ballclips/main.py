@@ -84,22 +84,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
-        button_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        controls.pack_start(button_column, False, False, 0)
+        play_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        controls.pack_start(play_column, False, False, 0)
 
         play_pause_button = Gtk.Button.new_from_icon_name(
             "media-playback-pause", Gtk.IconSize.BUTTON
         )
         play_pause_button.connect("clicked", self._on_play_pause_clicked)
-        button_column.pack_start(play_pause_button, False, False, 0)
-
-        set_in_button = Gtk.Button(label="{")
-        set_in_button.connect("clicked", self._on_set_in_clicked)
-        button_column.pack_start(set_in_button, False, False, 0)
-
-        set_out_button = Gtk.Button(label="}")
-        set_out_button.connect("clicked", self._on_set_out_clicked)
-        button_column.pack_start(set_out_button, False, False, 0)
+        play_column.pack_start(play_pause_button, False, False, 0)
 
         progress_adjustment = Gtk.Adjustment(0.0, 0.0, 1.0, 0.1, 1.0, 0.0)
         progress_scale = Gtk.Scale.new(Gtk.Orientation.HORIZONTAL, progress_adjustment)
@@ -107,9 +99,11 @@ class PlayerWindow(Gtk.ApplicationWindow):
         progress_scale.set_draw_value(False)
         progress_scale.connect("value-changed", self._on_progress_changed)
 
-        timeline_column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        timeline_column.set_hexpand(True)
-        timeline_column.pack_start(progress_scale, False, False, 0)
+        set_in_button = Gtk.Button(label="{")
+        set_in_button.connect("clicked", self._on_set_in_clicked)
+
+        set_out_button = Gtk.Button(label="}")
+        set_out_button.connect("clicked", self._on_set_out_clicked)
 
         trim_area = Gtk.DrawingArea()
         trim_area.set_hexpand(True)
@@ -123,9 +117,32 @@ class PlayerWindow(Gtk.ApplicationWindow):
         trim_area.connect("button-press-event", self._on_trim_button_press)
         trim_area.connect("button-release-event", self._on_trim_button_release)
         trim_area.connect("motion-notify-event", self._on_trim_motion)
-        timeline_column.pack_start(trim_area, False, False, 0)
 
-        controls.pack_start(timeline_column, True, True, 0)
+        timeline_grid = Gtk.Grid()
+        timeline_grid.set_row_spacing(6)
+        timeline_grid.set_column_spacing(6)
+        timeline_grid.set_hexpand(True)
+
+        left_spacer = Gtk.Box()
+        right_spacer = Gtk.Box()
+
+        timeline_grid.attach(left_spacer, 0, 0, 1, 1)
+        timeline_grid.attach(progress_scale, 1, 0, 1, 1)
+        timeline_grid.attach(right_spacer, 2, 0, 1, 1)
+
+        timeline_grid.attach(set_in_button, 0, 1, 1, 1)
+        timeline_grid.attach(trim_area, 1, 1, 1, 1)
+        timeline_grid.attach(set_out_button, 2, 1, 1, 1)
+
+        left_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
+        left_group.add_widget(left_spacer)
+        left_group.add_widget(set_in_button)
+
+        right_group = Gtk.SizeGroup(Gtk.SizeGroupMode.HORIZONTAL)
+        right_group.add_widget(right_spacer)
+        right_group.add_widget(set_out_button)
+
+        controls.pack_start(timeline_grid, True, True, 0)
 
         container.pack_start(controls, False, False, 0)
         self.add(container)
