@@ -5,8 +5,9 @@ from __future__ import annotations
 import argparse
 import sys
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Literal, Sequence, TYPE_CHECKING
 
 import gi
 
@@ -14,7 +15,30 @@ gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("Gst", "1.0")
 
-from gi.repository import Gdk, GLib, Gst, Gtk, Pango, GstPbutils, cairo
+try:
+    gi.require_version("GstPbutils", "1.0")
+except (ValueError, ImportError):
+    _GST_PBUTILS_AVAILABLE = False
+else:
+    _GST_PBUTILS_AVAILABLE = True
+
+from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
+
+if _GST_PBUTILS_AVAILABLE:
+    try:
+        from gi.repository import GstPbutils  # type: ignore
+    except ImportError:  # pragma: no cover - depends on system packages
+        GstPbutils = None  # type: ignore[assignment]
+        _GST_PBUTILS_AVAILABLE = False
+else:
+    GstPbutils = None  # type: ignore[assignment]
+
+if TYPE_CHECKING:
+    from gi.repository import GstPbutils as GstPbutilsTypes  # pragma: no cover
+else:
+    GstPbutilsTypes = object
+
+_PBUTILS_WARNING_EMITTED = False
 
 
 @dataclass
@@ -48,6 +72,42 @@ class CropRegion:
         left = max(offset_x, min(left, offset_x + width - size_px))
         top = max(offset_y, min(top, offset_y + height - size_px))
         return left, top, size_px
+
+
+def _coerce_fraction(value: object) -> tuple[int, int] | None:
+    if value is None:
+        return None
+    if isinstance(value, Fraction):
+        return int(value.numerator), int(value.denominator)
+    if isinstance(value, tuple) and len(value) == 2:
+        num, den = value
+        try:
+            return int(num), int(den)
+        except (TypeError, ValueError):
+            return None
+    if hasattr(value, "numerator") and hasattr(value, "denominator"):
+        try:
+            return int(value.numerator), int(value.denominator)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    if hasattr(value, "num") and hasattr(value, "den"):
+        try:
+            return int(value.num), int(value.den)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    if hasattr(value, "n") and hasattr(value, "d"):
+        try:
+            return int(value.n), int(value.d)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _structure_fraction(structure: Gst.Structure, field: str) -> tuple[int, int] | None:
+    if not structure.has_field(field):
+        return None
+    value = structure.get_value(field)
+    return _coerce_fraction(value)
 
 
 def _list_mp4_files(folder: Path) -> list[Path]:
@@ -234,8 +294,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
         self._current_video_file: Path | None = None
-        self._discoverer: GstPbutils.Discoverer | None = None
-        self._discoverer_failed = False
+        self._discoverer: GstPbutilsTypes.Discoverer | None = None  # type: ignore[attr-defined]
+        self._discoverer_failed = not _GST_PBUTILS_AVAILABLE
         self._current_video_pixel_size: tuple[float, float] | None = None
 
         self._load_video(self._current_index)
@@ -334,11 +394,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         self._app.set_current_index(self._current_index)
 
-    def _ensure_discoverer(self) -> GstPbutils.Discoverer | None:
+    def _ensure_discoverer(self) -> GstPbutilsTypes.Discoverer | None:  # type: ignore[attr-defined]
+        if not _GST_PBUTILS_AVAILABLE:
+            return None
         if self._discoverer is not None or self._discoverer_failed:
             return self._discoverer
         try:
-            self._discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)
+            self._discoverer = GstPbutils.Discoverer.new(5 * Gst.SECOND)  # type: ignore[call-arg]
         except GLib.Error as exc:
             print(
                 f"Failed to initialise GStreamer discoverer: {exc.message}",
@@ -350,31 +412,121 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _probe_video_size(self, video_file: Path) -> tuple[float, float] | None:
         discoverer = self._ensure_discoverer()
-        if discoverer is None:
+        if discoverer is not None and GstPbutils is not None:
+            try:
+                info = discoverer.discover_uri(
+                    Gst.filename_to_uri(str(video_file.resolve()))
+                )
+            except GLib.Error as exc:
+                print(
+                    f"Unable to inspect video metadata for '{video_file.name}': {exc.message}",
+                    file=sys.stderr,
+                )
+            else:
+                for stream in info.get_video_streams():
+                    if not isinstance(stream, GstPbutils.DiscovererVideoInfo):
+                        continue
+                    width = float(stream.get_width())
+                    height = float(stream.get_height())
+                    if width <= 0.0 or height <= 0.0:
+                        continue
+                    par_num = stream.get_par_num()
+                    par_den = stream.get_par_den()
+                    if par_num > 0 and par_den > 0:
+                        width *= par_num / par_den
+                    return width, height
+
+        fallback = self._probe_video_size_from_caps(video_file)
+        if fallback is None and not _GST_PBUTILS_AVAILABLE:
+            global _PBUTILS_WARNING_EMITTED
+            if not _PBUTILS_WARNING_EMITTED:
+                print(
+                    "GStreamer GstPbutils introspection data is unavailable. Install "
+                    "the gstreamer1.0-plugins-base (or equivalent) package to improve "
+                    "letterbox detection for crop regions.",
+                    file=sys.stderr,
+                )
+                _PBUTILS_WARNING_EMITTED = True
+        return fallback
+
+    def _probe_video_size_from_caps(self, video_file: Path) -> tuple[float, float] | None:
+        pipeline = Gst.Pipeline.new("ballclips-metadata-probe")
+        if pipeline is None:
             return None
+
+        decodebin = Gst.ElementFactory.make("uridecodebin", "metadata_decodebin")
+        sink = Gst.ElementFactory.make("fakesink", "metadata_sink")
+        if decodebin is None or sink is None:
+            pipeline.set_state(Gst.State.NULL)
+            return None
+
+        sink.set_property("sync", False)
+        sink.set_property("enable-last-sample", False)
+
+        pipeline.add(decodebin)
+        pipeline.add(sink)
+
+        result: dict[str, tuple[float, float] | None] = {"size": None}
+
+        def _on_pad_added(_bin: Gst.Element, pad: Gst.Pad, _sink: Gst.Element) -> None:
+            if result["size"] is not None:
+                return
+            caps = pad.get_current_caps()
+            if caps is None:
+                caps = pad.query_caps()
+            if caps is None or caps.get_size() == 0:
+                return
+            structure = caps.get_structure(0)
+            if structure is None:
+                return
+            name = structure.get_name()
+            if not name.startswith("video/"):
+                return
+            width = structure.get_value("width")
+            height = structure.get_value("height")
+            if not isinstance(width, int) or not isinstance(height, int):
+                return
+            if width <= 0 or height <= 0:
+                return
+            par = _structure_fraction(structure, "pixel-aspect-ratio")
+            width_f = float(width)
+            height_f = float(height)
+            if par is not None:
+                par_num, par_den = par
+                if par_num > 0 and par_den > 0:
+                    width_f *= par_num / par_den
+            result["size"] = (width_f, height_f)
+            sink_pad = _sink.get_static_pad("sink")
+            if sink_pad is not None and not sink_pad.is_linked():
+                pad.link(sink_pad)
+
+        decodebin.connect("pad-added", _on_pad_added, sink)
+        decodebin.set_property("uri", Gst.filename_to_uri(str(video_file.resolve())))
+
+        bus = pipeline.get_bus()
+        if bus is None:
+            pipeline.set_state(Gst.State.NULL)
+            return None
+
+        pipeline.set_state(Gst.State.PAUSED)
         try:
-            info = discoverer.discover_uri(Gst.filename_to_uri(str(video_file.resolve())))
-        except GLib.Error as exc:
-            print(
-                f"Unable to inspect video metadata for '{video_file.name}': {exc.message}",
-                file=sys.stderr,
+            message = bus.timed_pop_filtered(
+                5 * Gst.SECOND,
+                Gst.MessageType.ASYNC_DONE
+                | Gst.MessageType.ERROR
+                | Gst.MessageType.EOS,
             )
-            return None
+            if message is not None and message.type == Gst.MessageType.ERROR:
+                err, debug = message.parse_error()
+                detail = f" ({debug})" if debug else ""
+                print(
+                    f"Unable to extract video metadata for '{video_file.name}': {err.message}{detail}",
+                    file=sys.stderr,
+                )
+        finally:
+            pipeline.set_state(Gst.State.NULL)
 
-        for stream in info.get_video_streams():
-            if not isinstance(stream, GstPbutils.DiscovererVideoInfo):
-                continue
-            width = float(stream.get_width())
-            height = float(stream.get_height())
-            if width <= 0.0 or height <= 0.0:
-                continue
-            par_num = stream.get_par_num()
-            par_den = stream.get_par_den()
-            if par_num > 0 and par_den > 0:
-                width *= par_num / par_den
-            return width, height
-
-        return None
+        return result["size"]
 
     def _on_destroy(self, *_args: object) -> None:
         self._player.set_state(Gst.State.NULL)
