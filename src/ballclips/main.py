@@ -686,18 +686,14 @@ class PlayerWindow(Gtk.ApplicationWindow):
         out_region = default_out
         metadata = self._load_video_metadata(video_file)
         if metadata is not None:
-            square_data = metadata.get("square_cropping")
+            square_data = getattr(metadata, "square_cropping", None)
             if isinstance(square_data, SquareCroppingData):
-                in_point = square_data.get("in_point")
-                out_point = square_data.get("out_point")
-                if isinstance(in_point, SquareCroppingPoint):
-                    converted = self._square_point_to_crop_region(in_point)
-                    if converted is not None:
-                        in_region = converted
-                if isinstance(out_point, SquareCroppingPoint):
-                    converted = self._square_point_to_crop_region(out_point)
-                    if converted is not None:
-                        out_region = converted
+                converted_in = self._square_point_to_crop_region(square_data.in_point)
+                if converted_in is not None:
+                    in_region = converted_in
+                converted_out = self._square_point_to_crop_region(square_data.out_point)
+                if converted_out is not None:
+                    out_region = converted_out
             elif isinstance(square_data, SquareCroppingPoint):
                 converted = self._square_point_to_crop_region(square_data)
                 if converted is not None:
@@ -788,9 +784,9 @@ class PlayerWindow(Gtk.ApplicationWindow):
         video_w, video_h = video_size
         if video_w <= 0 or video_h <= 0:
             return None
-        u = point.get("u")
-        v = point.get("v")
-        size = point.get("size")
+        u = point.u
+        v = point.v
+        size = point.size
         if not isinstance(u, (int, float)) or not isinstance(v, (int, float)):
             return None
         if not isinstance(size, (int, float)):
