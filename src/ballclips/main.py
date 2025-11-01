@@ -168,17 +168,37 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _create_video_sink(self) -> tuple[Gst.Element, Gtk.Widget]:
         """Choose a GTK sink that keeps frames on the GPU when possible."""
 
-        # Prefer gtkglsink because it hands frames to GTK through an OpenGL-backed
-        # widget, avoiding the CPU read-backs that make high-bitrate clips stall in
-        # virtualised environments.  If that plugin is unavailable we fall back to
-        # gtksink so the UI remains functional.
-        for name in ("gtkglsink", "gtksink"):
-            sink = Gst.ElementFactory.make(name, f"video_sink_{name}")
-            if sink is None:
-                continue
-            widget = getattr(sink.props, "widget", None)
+        # Prefer a GL-backed sink so the video can be rendered by the GPU when
+        # available, but wrap it in glsinkbin so software decoders can still
+        # negotiate with a conventional video/x-raw surface.  If the GL stack is
+        # missing we fall back to gtksink so playback keeps working everywhere.
+
+        def _build_gtkglsink() -> tuple[Gst.Element, Gtk.Widget] | None:
+            gtkgl = Gst.ElementFactory.make("gtkglsink", "gtkglsink")
+            if gtkgl is None:
+                return None
+            widget = getattr(gtkgl.props, "widget", None)
+            if not isinstance(widget, Gtk.Widget):
+                return None
+
+            glbin = Gst.ElementFactory.make("glsinkbin", "gtkglsink_bin")
+            if glbin is None:
+                return None
+            glbin.set_property("sink", gtkgl)
+            return glbin, widget
+
+        builders = (_build_gtkglsink,)
+        for build in builders:
+            result = build()
+            if result is not None:
+                return result
+
+        # Fallback: CPU-bound GTK sink.
+        gtksink = Gst.ElementFactory.make("gtksink", "gtksink")
+        if gtksink is not None:
+            widget = getattr(gtksink.props, "widget", None)
             if isinstance(widget, Gtk.Widget):
-                return sink, widget
+                return gtksink, widget
 
         raise RuntimeError(
             "No suitable GTK video sink is available. Install the GStreamer GTK plugins."
