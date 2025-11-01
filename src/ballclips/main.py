@@ -106,8 +106,15 @@ def _coerce_fraction(value: object) -> tuple[int, int] | None:
 def _structure_fraction(structure: Gst.Structure, field: str) -> tuple[int, int] | None:
     if not structure.has_field(field):
         return None
-    value = structure.get_value(field)
-    return _coerce_fraction(value)
+    try:
+        success, numerator, denominator = structure.get_fraction(field)
+    except TypeError:
+        value = structure.get_value(field)
+        return _coerce_fraction(value)
+    else:
+        if success:
+            return int(numerator), int(denominator)
+        return None
 
 
 def _list_mp4_files(folder: Path) -> list[Path]:
@@ -462,6 +469,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         sink.set_property("sync", False)
         sink.set_property("enable-last-sample", False)
+        # Limit the pads we receive to raw video to avoid not-linked errors from
+        # audio streams when probing metadata.
+        decode_caps = Gst.Caps.from_string("video/x-raw")
+        decodebin.set_property("caps", decode_caps)
 
         pipeline.add(decodebin)
         pipeline.add(sink)
