@@ -365,9 +365,17 @@ def _determine_crop_filter(
         ]
     )
 
-    # Guard against frames with missing timestamps (t=NaN) by falling back to a
-    # frame-index based interpolation.
-    progress_expr = f"if(isnan(t),{frame_progress_expr},{time_progress_expr})"
+    # Combine both time- and frame-based progress estimates so that either can
+    # drive the interpolation. This allows videos with valid timestamps to rely
+    # on `t`, while sources lacking them (or whose timestamps collapse to a
+    # constant value) still interpolate using the frame index.
+    progress_expr = "".join(
+        [
+            "min(1,",
+            f"max({frame_progress_expr},{time_progress_expr})",
+            ")",
+        ]
+    )
 
     delta_x = _format_ffmpeg_float(end_x - start_x)
     delta_y = _format_ffmpeg_float(end_y - start_y)
