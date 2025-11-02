@@ -231,6 +231,13 @@ def _format_ffmpeg_float(value: float) -> str:
     return text
 
 
+def _escape_ffmpeg_expr(expression: str) -> str:
+    """Escape characters in an ffmpeg filter expression."""
+
+    # Commas separate filters/arguments, so escape them to treat them as literals.
+    return expression.replace(",", r"\,")
+
+
 def _sanitize_crop_metadata(
     metadata: CropMetadata, width: int, height: int
 ) -> tuple[float, float, float]:
@@ -317,9 +324,11 @@ def _determine_crop_filter(
     start_y_str = _format_ffmpeg_float(start_y)
     start_size_str = _format_ffmpeg_float(start_size)
 
-    size_expr = f"({start_size_str})+({delta_size})*{progress_expr}"
-    x_expr = f"({start_x_str})+({delta_x})*{progress_expr}"
-    y_expr = f"({start_y_str})+({delta_y})*{progress_expr}"
+    size_expr = _escape_ffmpeg_expr(
+        f"({start_size_str})+({delta_size})*{progress_expr}"
+    )
+    x_expr = _escape_ffmpeg_expr(f"({start_x_str})+({delta_x})*{progress_expr}")
+    y_expr = _escape_ffmpeg_expr(f"({start_y_str})+({delta_y})*{progress_expr}")
 
     expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}"
     return CropFilterSpec(expression=expression, time_variant=True)
