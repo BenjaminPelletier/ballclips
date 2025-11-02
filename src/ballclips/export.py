@@ -370,12 +370,23 @@ def _determine_crop_filter(
     # Combine both time- and frame-based progress estimates so that either can
     # drive the interpolation. This allows videos with valid timestamps to rely
     # on `t`, while sources lacking them (or whose timestamps collapse to a
-    # constant value) still interpolate using the frame index.
+    # constant value) still interpolate using the frame index. Each individual
+    # expression is already clipped to the range [0, 1], so computing the larger
+    # value can be done arithmetically without introducing additional functions
+    # that require comma-separated arguments (which become difficult to escape
+    # once embedded inside the filter graph).
     progress_expr = "".join(
         [
-            "min(1,",
-            f"max({frame_progress_expr},{time_progress_expr})",
-            ")",
+            "(",
+            "(",
+            frame_progress_expr,
+            ")+(",
+            time_progress_expr,
+            ")+abs((",
+            frame_progress_expr,
+            ")-(",
+            time_progress_expr,
+            ")))/2",
         ]
     )
 
