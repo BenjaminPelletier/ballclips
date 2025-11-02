@@ -52,6 +52,15 @@ class CropMetadata:
         center_y = max(half, min(avg_v, height - half))
         return cls(center_x=center_x, center_y=center_y, size=size_px)
 
+    @classmethod
+    def from_point(
+        cls,
+        width: int,
+        height: int,
+        point: dict[str, object],
+    ) -> "CropMetadata" | None:
+        return cls.from_points(width, height, [point])
+
 
 @dataclass
 class CropRegion:
@@ -64,6 +73,14 @@ class CropRegion:
     @property
     def filter_expression(self) -> str:
         return f"crop={self.size}:{self.size}:{self.x}:{self.y}"
+
+
+@dataclass
+class CropFilterSpec:
+    """Specification describing how to crop a video frame."""
+
+    expression: str
+    time_variant: bool = False
 
 
 @dataclass
@@ -203,6 +220,111 @@ def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion
     return CropRegion(x=x, y=y, size=size)
 
 
+def _format_ffmpeg_float(value: float) -> str:
+    if math.isclose(value, 0.0, abs_tol=1e-9):
+        value = 0.0
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    if text in {"", "-"}:
+        return "0"
+    if text == "-0":
+        return "0"
+    return text
+
+
+def _sanitize_crop_metadata(
+    metadata: CropMetadata, width: int, height: int
+) -> tuple[float, float, float]:
+    size = max(1.0, min(metadata.size, float(min(width, height))))
+    half = size / 2.0
+    center_x = max(half, min(metadata.center_x, width - half))
+    center_y = max(half, min(metadata.center_y, height - half))
+    max_x = width - size
+    max_y = height - size
+    x = max(0.0, min(center_x - half, max_x))
+    y = max(0.0, min(center_y - half, max_y))
+    return x, y, size
+
+
+def _extract_point_time(
+    point: dict[str, object], frame_rate: float | None
+) -> float | None:
+    frame_value = point.get("frame")
+    if frame_value is None:
+        return None
+    try:
+        frame_float = float(frame_value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(frame_float):
+        return None
+    return _frame_to_seconds(frame_float, frame_rate)
+
+
+def _determine_crop_filter(
+    video_path: Path,
+    info: VideoProbeInfo,
+    trim_range: tuple[float, float] | None,
+) -> CropFilterSpec:
+    fallback_region = _determine_crop_region(video_path, info)
+    fallback_spec = CropFilterSpec(
+        expression=fallback_region.filter_expression, time_variant=False
+    )
+
+    metadata = _load_crop_metadata(video_path.with_suffix(".json"))
+    if not isinstance(metadata, dict):
+        return fallback_spec
+    square = metadata.get("square_cropping")
+    if not isinstance(square, dict):
+        return fallback_spec
+
+    in_point_obj = square.get("in_point")
+    out_point_obj = square.get("out_point")
+    if not isinstance(in_point_obj, dict) or not isinstance(out_point_obj, dict):
+        return fallback_spec
+
+    in_metadata = CropMetadata.from_point(info.width, info.height, in_point_obj)
+    out_metadata = CropMetadata.from_point(info.width, info.height, out_point_obj)
+    if in_metadata is None or out_metadata is None:
+        return fallback_spec
+
+    start_time = _extract_point_time(in_point_obj, info.frame_rate)
+    end_time = _extract_point_time(out_point_obj, info.frame_rate)
+    if start_time is None or end_time is None:
+        return fallback_spec
+    if end_time <= start_time:
+        return fallback_spec
+
+    start_x, start_y, start_size = _sanitize_crop_metadata(
+        in_metadata, info.width, info.height
+    )
+    end_x, end_y, end_size = _sanitize_crop_metadata(
+        out_metadata, info.width, info.height
+    )
+
+    trim_start = trim_range[0] if trim_range is not None else 0.0
+    offset = start_time - trim_start
+    duration = max(end_time - start_time, 1e-6)
+
+    offset_str = _format_ffmpeg_float(offset)
+    duration_str = _format_ffmpeg_float(duration)
+    progress_expr = f"min(1,max(0,(t-({offset_str}))/{duration_str}))"
+
+    delta_x = _format_ffmpeg_float(end_x - start_x)
+    delta_y = _format_ffmpeg_float(end_y - start_y)
+    delta_size = _format_ffmpeg_float(end_size - start_size)
+
+    start_x_str = _format_ffmpeg_float(start_x)
+    start_y_str = _format_ffmpeg_float(start_y)
+    start_size_str = _format_ffmpeg_float(start_size)
+
+    size_expr = f"({start_size_str})+({delta_size})*{progress_expr}"
+    x_expr = f"({start_x_str})+({delta_x})*{progress_expr}"
+    y_expr = f"({start_y_str})+({delta_y})*{progress_expr}"
+
+    expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}"
+    return CropFilterSpec(expression=expression, time_variant=True)
+
+
 def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
     if frame_rate is None or frame_rate <= 0:
         return max(0.0, frame_value) / 1000.0
@@ -246,12 +368,20 @@ def _determine_trim_range(video_path: Path, info: VideoProbeInfo) -> tuple[float
 def _build_encoding_command(
     source: Path,
     destination: Path,
-    crop_region: CropRegion,
+    crop_filter: CropFilterSpec,
     trim_range: tuple[float, float] | None,
 ) -> list[str]:
-    filter_chain = ",".join(
-        [crop_region.filter_expression, "scale=480:480:flags=lanczos", "setsar=1"]
+    filter_parts = []
+    if crop_filter.time_variant:
+        filter_parts.append("setpts=PTS-STARTPTS")
+    filter_parts.extend(
+        [
+            crop_filter.expression,
+            "scale=480:480:flags=lanczos",
+            "setsar=1",
+        ]
     )
+    filter_chain = ",".join(filter_parts)
     command = [
         "ffmpeg",
         "-y",
@@ -316,11 +446,11 @@ def _encode_segments(video_files: Sequence[Path], tmpdir: Path) -> list[Path]:
     total = len(video_files)
     for index, video_path in enumerate(video_files, start=1):
         info = _probe_video_info(video_path)
-        crop_region = _determine_crop_region(video_path, info)
         trim_range = _determine_trim_range(video_path, info)
+        crop_filter = _determine_crop_filter(video_path, info, trim_range)
         segment_path = tmpdir / f"segment_{index:03d}.mp4"
         print(f"[{index}/{total}] Encoding {video_path.name}...", flush=True)
-        cmd = _build_encoding_command(video_path, segment_path, crop_region, trim_range)
+        cmd = _build_encoding_command(video_path, segment_path, crop_filter, trim_range)
         process = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if process.returncode != 0:
             raise RuntimeError(
