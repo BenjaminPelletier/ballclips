@@ -360,7 +360,9 @@ def _determine_crop_filter(
     x_expr = _escape_ffmpeg_expr(f"({start_x_str})+({delta_x})*{progress_expr}")
     y_expr = _escape_ffmpeg_expr(f"({start_y_str})+({delta_y})*{progress_expr}")
 
-    expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}:eval=frame"
+    expression = (
+        f"crop=w={size_expr}:h={size_expr}:x={x_expr}:y={y_expr}"
+    )
     return CropFilterSpec(expression=expression, time_variant=True)
 
 
