@@ -79,8 +79,9 @@ class CropRegion:
 class CropFilterSpec:
     """Specification describing how to crop a video frame."""
 
-    expression: str
+    filters: list[str]
     time_variant: bool = False
+    produces_scaled_output: bool = False
 
 
 @dataclass
@@ -238,6 +239,51 @@ def _escape_ffmpeg_expr(expression: str) -> str:
     return expression.replace(",", r"\,")
 
 
+def _build_combined_progress_expression(
+    frame_symbol: str,
+    time_symbol: str,
+    offset_frames_str: str,
+    last_transition_frame_str: str,
+    denom_frames_str: str,
+    offset_str: str,
+    end_offset_str: str,
+    frame_interval_str: str,
+    duration_str: str,
+) -> str:
+    """Construct a progress expression that blends frame and time estimates."""
+
+    frame_progress_expr = "".join(
+        [
+            f"if(lte({frame_symbol},{offset_frames_str}),0,",
+            f"min(1,if(gte({frame_symbol},{last_transition_frame_str}),1,({frame_symbol}-({offset_frames_str}))/{denom_frames_str}))",
+            ")",
+        ]
+    )
+
+    time_progress_expr = "".join(
+        [
+            f"if(lte({time_symbol},{offset_str}),0,",
+            f"min(1,if(gte({time_symbol},{end_offset_str}),1,(({time_symbol}-({offset_str}))+({frame_interval_str}))/{duration_str}))",
+            ")",
+        ]
+    )
+
+    return "".join(
+        [
+            "(",
+            "(",
+            frame_progress_expr,
+            ")+(",
+            time_progress_expr,
+            ")+abs((",
+            frame_progress_expr,
+            ")-(",
+            time_progress_expr,
+            ")))/2",
+        ]
+    )
+
+
 def _sanitize_crop_metadata(
     metadata: CropMetadata, width: int, height: int
 ) -> tuple[float, float, float]:
@@ -274,7 +320,8 @@ def _determine_crop_filter(
 ) -> CropFilterSpec:
     fallback_region = _determine_crop_region(video_path, info)
     fallback_spec = CropFilterSpec(
-        expression=fallback_region.filter_expression, time_variant=False
+        filters=[fallback_region.filter_expression],
+        time_variant=False,
     )
 
     metadata = _load_crop_metadata(video_path.with_suffix(".json"))
@@ -284,22 +331,33 @@ def _determine_crop_filter(
     if not isinstance(square, dict):
         return fallback_spec
 
+    def _fail(reason: str) -> RuntimeError:
+        return RuntimeError(
+            f"{video_path.name} has square_cropping metadata but {reason}"
+        )
+
     in_point_obj = square.get("in_point")
     out_point_obj = square.get("out_point")
-    if not isinstance(in_point_obj, dict) or not isinstance(out_point_obj, dict):
-        return fallback_spec
+    if not isinstance(in_point_obj, dict):
+        raise _fail("is missing a valid 'in_point' entry.")
+    if not isinstance(out_point_obj, dict):
+        raise _fail("is missing a valid 'out_point' entry.")
 
     in_metadata = CropMetadata.from_point(info.width, info.height, in_point_obj)
     out_metadata = CropMetadata.from_point(info.width, info.height, out_point_obj)
-    if in_metadata is None or out_metadata is None:
-        return fallback_spec
+    if in_metadata is None:
+        raise _fail("its 'in_point' metadata is incomplete or invalid.")
+    if out_metadata is None:
+        raise _fail("its 'out_point' metadata is incomplete or invalid.")
 
     start_time = _extract_point_time(in_point_obj, info.frame_rate)
     end_time = _extract_point_time(out_point_obj, info.frame_rate)
-    if start_time is None or end_time is None:
-        return fallback_spec
+    if start_time is None:
+        raise _fail("its 'in_point' does not define a usable frame/time.")
+    if end_time is None:
+        raise _fail("its 'out_point' does not define a usable frame/time.")
     if end_time <= start_time:
-        return fallback_spec
+        raise _fail("its 'out_point' occurs on or before its 'in_point'.")
 
     start_x, start_y, start_size = _sanitize_crop_metadata(
         in_metadata, info.width, info.height
@@ -321,36 +379,117 @@ def _determine_crop_filter(
         frame_interval = 1.0 / 30.0
     if not math.isfinite(frame_interval) or frame_interval <= 0.0:
         frame_interval = 1.0 / 30.0
+    frame_step = frame_interval
     frame_interval = min(frame_interval, duration)
     frame_interval_str = _format_ffmpeg_float(frame_interval)
-    end_offset_str = _format_ffmpeg_float(offset + duration)
-    # Guard against frames with missing timestamps (t=NaN) by falling back to the
-    # starting crop window until a valid timestamp is observed.
-    progress_expr = "".join(
-        [
-            "if(isnan(t),0,",
-            f"if(lte(t,{offset_str}),0,",
-            f"min(1,if(gte(t,{end_offset_str}),1,((t-({offset_str}))+({frame_interval_str}))/{duration_str}))",
-            "))",
-        ]
+    end_offset = offset + duration
+    end_offset_str = _format_ffmpeg_float(end_offset)
+
+    # Estimate frame-based timings to support sources whose timestamps are missing.
+    offset_frames = 0
+    if frame_step > 0:
+        offset_frames = max(int(math.floor(offset / frame_step)), 0)
+    transition_frames = max(int(math.ceil(duration / frame_step)), 1)
+    last_transition_frame = offset_frames + transition_frames - 1
+    denom_frames = max(transition_frames - 1, 1)
+    offset_frames_str = str(offset_frames)
+    last_transition_frame_str = str(last_transition_frame)
+    denom_frames_str = str(denom_frames)
+
+    # Combine both time- and frame-based progress estimates so that either can
+    # drive the interpolation. This allows videos with valid timestamps to rely
+    # on `t`, while sources lacking them (or whose timestamps collapse to a
+    # constant value) still interpolate using the frame index. Each individual
+    # expression is already clipped to the range [0, 1], so computing the larger
+    # value can be done arithmetically without introducing additional functions
+    # that require comma-separated arguments (which become difficult to escape
+    # once embedded inside the filter graph).
+    progress_expr = _build_combined_progress_expression(
+        "n",
+        "t",
+        offset_frames_str,
+        last_transition_frame_str,
+        denom_frames_str,
+        offset_str,
+        end_offset_str,
+        frame_interval_str,
+        duration_str,
     )
 
-    delta_x = _format_ffmpeg_float(end_x - start_x)
-    delta_y = _format_ffmpeg_float(end_y - start_y)
+    zoompan_progress_expr = _build_combined_progress_expression(
+        "on",
+        "time",
+        offset_frames_str,
+        last_transition_frame_str,
+        denom_frames_str,
+        offset_str,
+        end_offset_str,
+        frame_interval_str,
+        duration_str,
+    )
+
     delta_size = _format_ffmpeg_float(end_size - start_size)
 
-    start_x_str = _format_ffmpeg_float(start_x)
-    start_y_str = _format_ffmpeg_float(start_y)
     start_size_str = _format_ffmpeg_float(start_size)
 
-    size_expr = _escape_ffmpeg_expr(
-        f"({start_size_str})+({delta_size})*{progress_expr}"
-    )
-    x_expr = _escape_ffmpeg_expr(f"({start_x_str})+({delta_x})*{progress_expr}")
-    y_expr = _escape_ffmpeg_expr(f"({start_y_str})+({delta_y})*{progress_expr}")
+    size_expr_raw = f"({start_size_str})+({delta_size})*{progress_expr}"
+    zoom_size_expr_raw = f"({start_size_str})+({delta_size})*{zoompan_progress_expr}"
 
-    expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}"
-    return CropFilterSpec(expression=expression, time_variant=True)
+    base_size = max(start_size, end_size)
+    base_size_str = _format_ffmpeg_float(base_size)
+    base_half = base_size / 2.0
+    base_half_str = _format_ffmpeg_float(base_half)
+    max_crop_x = max(info.width - base_size, 0.0)
+    max_crop_y = max(info.height - base_size, 0.0)
+    max_crop_x_str = _format_ffmpeg_float(max_crop_x)
+    max_crop_y_str = _format_ffmpeg_float(max_crop_y)
+
+    start_center_x = start_x + (start_size / 2.0)
+    start_center_y = start_y + (start_size / 2.0)
+    end_center_x = end_x + (end_size / 2.0)
+    end_center_y = end_y + (end_size / 2.0)
+    delta_center_x = end_center_x - start_center_x
+    delta_center_y = end_center_y - start_center_y
+
+    start_center_x_str = _format_ffmpeg_float(start_center_x)
+    start_center_y_str = _format_ffmpeg_float(start_center_y)
+    delta_center_x_str = _format_ffmpeg_float(delta_center_x)
+    delta_center_y_str = _format_ffmpeg_float(delta_center_y)
+
+    center_x_expr = (
+        f"({start_center_x_str})+({delta_center_x_str})*{progress_expr}"
+    )
+    center_y_expr = (
+        f"({start_center_y_str})+({delta_center_y_str})*{progress_expr}"
+    )
+
+    base_x_expr = _escape_ffmpeg_expr(
+        f"clip(({center_x_expr})-({base_half_str}),0,{max_crop_x_str})"
+    )
+    base_y_expr = _escape_ffmpeg_expr(
+        f"clip(({center_y_expr})-({base_half_str}),0,{max_crop_y_str})"
+    )
+
+    zoom_expr = _escape_ffmpeg_expr(
+        f"({base_size_str})/({zoom_size_expr_raw})"
+    )
+
+    crop_filter = (
+        f"crop=w={base_size_str}:h={base_size_str}:x='{base_x_expr}':y='{base_y_expr}'"
+    )
+    zoompan_filter = (
+        "zoompan="
+        f"z='{zoom_expr}':"
+        "x='(iw-iw/zoom)/2':"
+        "y='(ih-ih/zoom)/2':"
+        "d=1:s=480x480:fps=30"
+    )
+
+    return CropFilterSpec(
+        filters=[crop_filter, "fps=30", zoompan_filter],
+        time_variant=True,
+        produces_scaled_output=True,
+    )
 
 
 def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
@@ -402,13 +541,10 @@ def _build_encoding_command(
     filter_parts = []
     if crop_filter.time_variant:
         filter_parts.append("setpts=PTS-STARTPTS")
-    filter_parts.extend(
-        [
-            crop_filter.expression,
-            "scale=480:480:flags=lanczos",
-            "setsar=1",
-        ]
-    )
+    filter_parts.extend(crop_filter.filters)
+    if not crop_filter.produces_scaled_output:
+        filter_parts.append("scale=480:480:flags=lanczos")
+    filter_parts.append("setsar=1")
     filter_chain = ",".join(filter_parts)
     command = [
         "ffmpeg",
