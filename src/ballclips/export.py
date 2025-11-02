@@ -79,8 +79,9 @@ class CropRegion:
 class CropFilterSpec:
     """Specification describing how to crop a video frame."""
 
-    expression: str
+    filters: list[str]
     time_variant: bool = False
+    produces_scaled_output: bool = False
 
 
 @dataclass
@@ -274,7 +275,8 @@ def _determine_crop_filter(
 ) -> CropFilterSpec:
     fallback_region = _determine_crop_region(video_path, info)
     fallback_spec = CropFilterSpec(
-        expression=fallback_region.filter_expression, time_variant=False
+        filters=[fallback_region.filter_expression],
+        time_variant=False,
     )
 
     metadata = _load_crop_metadata(video_path.with_suffix(".json"))
@@ -377,24 +379,67 @@ def _determine_crop_filter(
         ]
     )
 
-    delta_x = _format_ffmpeg_float(end_x - start_x)
-    delta_y = _format_ffmpeg_float(end_y - start_y)
     delta_size = _format_ffmpeg_float(end_size - start_size)
 
-    start_x_str = _format_ffmpeg_float(start_x)
-    start_y_str = _format_ffmpeg_float(start_y)
     start_size_str = _format_ffmpeg_float(start_size)
 
-    size_expr = _escape_ffmpeg_expr(
-        f"({start_size_str})+({delta_size})*{progress_expr}"
-    )
-    x_expr = _escape_ffmpeg_expr(f"({start_x_str})+({delta_x})*{progress_expr}")
-    y_expr = _escape_ffmpeg_expr(f"({start_y_str})+({delta_y})*{progress_expr}")
+    size_expr_raw = f"({start_size_str})+({delta_size})*{progress_expr}"
 
-    expression = (
-        f"crop=w={size_expr}:h={size_expr}:x={x_expr}:y={y_expr}"
+    base_size = max(start_size, end_size)
+    base_size_str = _format_ffmpeg_float(base_size)
+    base_half = base_size / 2.0
+    base_half_str = _format_ffmpeg_float(base_half)
+    max_crop_x = max(info.width - base_size, 0.0)
+    max_crop_y = max(info.height - base_size, 0.0)
+    max_crop_x_str = _format_ffmpeg_float(max_crop_x)
+    max_crop_y_str = _format_ffmpeg_float(max_crop_y)
+
+    start_center_x = start_x + (start_size / 2.0)
+    start_center_y = start_y + (start_size / 2.0)
+    end_center_x = end_x + (end_size / 2.0)
+    end_center_y = end_y + (end_size / 2.0)
+    delta_center_x = end_center_x - start_center_x
+    delta_center_y = end_center_y - start_center_y
+
+    start_center_x_str = _format_ffmpeg_float(start_center_x)
+    start_center_y_str = _format_ffmpeg_float(start_center_y)
+    delta_center_x_str = _format_ffmpeg_float(delta_center_x)
+    delta_center_y_str = _format_ffmpeg_float(delta_center_y)
+
+    center_x_expr = (
+        f"({start_center_x_str})+({delta_center_x_str})*{progress_expr}"
     )
-    return CropFilterSpec(expression=expression, time_variant=True)
+    center_y_expr = (
+        f"({start_center_y_str})+({delta_center_y_str})*{progress_expr}"
+    )
+
+    base_x_expr = _escape_ffmpeg_expr(
+        f"clip(({center_x_expr})-({base_half_str}),0,{max_crop_x_str})"
+    )
+    base_y_expr = _escape_ffmpeg_expr(
+        f"clip(({center_y_expr})-({base_half_str}),0,{max_crop_y_str})"
+    )
+
+    zoom_expr = _escape_ffmpeg_expr(
+        f"({base_size_str})/({size_expr_raw})"
+    )
+
+    crop_filter = (
+        f"crop=w={base_size_str}:h={base_size_str}:x='{base_x_expr}':y='{base_y_expr}'"
+    )
+    zoompan_filter = (
+        "zoompan="
+        f"z='{zoom_expr}':"
+        "x='(iw-iw/zoom)/2':"
+        "y='(ih-ih/zoom)/2':"
+        "d=1:s=480x480:fps=30"
+    )
+
+    return CropFilterSpec(
+        filters=[crop_filter, "fps=30", zoompan_filter],
+        time_variant=True,
+        produces_scaled_output=True,
+    )
 
 
 def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
@@ -446,13 +491,10 @@ def _build_encoding_command(
     filter_parts = []
     if crop_filter.time_variant:
         filter_parts.append("setpts=PTS-STARTPTS")
-    filter_parts.extend(
-        [
-            crop_filter.expression,
-            "scale=480:480:flags=lanczos",
-            "setsar=1",
-        ]
-    )
+    filter_parts.extend(crop_filter.filters)
+    if not crop_filter.produces_scaled_output:
+        filter_parts.append("scale=480:480:flags=lanczos")
+    filter_parts.append("setsar=1")
     filter_chain = ",".join(filter_parts)
     command = [
         "ffmpeg",
