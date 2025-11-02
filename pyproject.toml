@@ -15,6 +15,7 @@ build-backend = "hatchling.build"
 
 [project.scripts]
 ballclips = "ballclips.main:main"
+ballclips-export = "ballclips.export:main"
 
 [tool.uv]
 package = true
