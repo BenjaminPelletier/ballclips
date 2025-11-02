@@ -314,6 +314,15 @@ def _determine_crop_filter(
 
     offset_str = _format_ffmpeg_float(offset)
     duration_str = _format_ffmpeg_float(duration)
+
+    if info.frame_rate is not None and info.frame_rate > 0:
+        frame_interval = 1.0 / info.frame_rate
+    else:
+        frame_interval = 1.0 / 30.0
+    if not math.isfinite(frame_interval) or frame_interval <= 0.0:
+        frame_interval = 1.0 / 30.0
+    frame_interval = min(frame_interval, duration)
+    frame_interval_str = _format_ffmpeg_float(frame_interval)
     end_offset_str = _format_ffmpeg_float(offset + duration)
     # Guard against frames with missing timestamps (t=NaN) by falling back to the
     # starting crop window until a valid timestamp is observed.
@@ -321,7 +330,7 @@ def _determine_crop_filter(
         [
             "if(isnan(t),0,",
             f"if(lte(t,{offset_str}),0,",
-            f"if(gte(t,{end_offset_str}),1,(t-({offset_str}))/{duration_str})",
+            f"min(1,if(gte(t,{end_offset_str}),1,((t-({offset_str}))+({frame_interval_str}))/{duration_str}))",
             "))",
         ]
     )
