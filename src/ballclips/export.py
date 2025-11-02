@@ -332,19 +332,42 @@ def _determine_crop_filter(
         frame_interval = 1.0 / 30.0
     if not math.isfinite(frame_interval) or frame_interval <= 0.0:
         frame_interval = 1.0 / 30.0
+    frame_step = frame_interval
     frame_interval = min(frame_interval, duration)
     frame_interval_str = _format_ffmpeg_float(frame_interval)
-    end_offset_str = _format_ffmpeg_float(offset + duration)
-    # Guard against frames with missing timestamps (t=NaN) by falling back to the
-    # starting crop window until a valid timestamp is observed.
-    progress_expr = "".join(
+    end_offset = offset + duration
+    end_offset_str = _format_ffmpeg_float(end_offset)
+
+    # Estimate frame-based timings to support sources whose timestamps are missing.
+    offset_frames = 0
+    if frame_step > 0:
+        offset_frames = max(int(math.floor(offset / frame_step)), 0)
+    transition_frames = max(int(math.ceil(duration / frame_step)), 1)
+    last_transition_frame = offset_frames + transition_frames - 1
+    denom_frames = max(transition_frames - 1, 1)
+    offset_frames_str = str(offset_frames)
+    last_transition_frame_str = str(last_transition_frame)
+    denom_frames_str = str(denom_frames)
+
+    frame_progress_expr = "".join(
         [
-            "if(isnan(t),0,",
-            f"if(lte(t,{offset_str}),0,",
-            f"min(1,if(gte(t,{end_offset_str}),1,((t-({offset_str}))+({frame_interval_str}))/{duration_str}))",
-            "))",
+            f"if(lte(n,{offset_frames_str}),0,",
+            f"min(1,if(gte(n,{last_transition_frame_str}),1,(n-({offset_frames_str}))/{denom_frames_str}))",
+            ")",
         ]
     )
+
+    time_progress_expr = "".join(
+        [
+            f"if(lte(t,{offset_str}),0,",
+            f"min(1,if(gte(t,{end_offset_str}),1,((t-({offset_str}))+({frame_interval_str}))/{duration_str}))",
+            ")",
+        ]
+    )
+
+    # Guard against frames with missing timestamps (t=NaN) by falling back to a
+    # frame-index based interpolation.
+    progress_expr = f"if(isnan(t),{frame_progress_expr},{time_progress_expr})"
 
     delta_x = _format_ffmpeg_float(end_x - start_x)
     delta_y = _format_ffmpeg_float(end_y - start_y)
