@@ -66,7 +66,40 @@ class CropRegion:
         return f"crop={self.size}:{self.size}:{self.x}:{self.y}"
 
 
-def _load_video_dimensions(path: Path) -> tuple[int, int]:
+@dataclass
+class VideoProbeInfo:
+    """Information gathered from probing a video file."""
+
+    width: int
+    height: int
+    duration: float | None
+    frame_rate: float | None
+
+
+def _parse_ratio(value: str | None) -> float | None:
+    if not value:
+        return None
+    if "/" in value:
+        num_str, den_str = value.split("/", 1)
+        try:
+            num = float(num_str)
+            den = float(den_str)
+        except ValueError:
+            return None
+        if den == 0:
+            return None
+        result = num / den
+    else:
+        try:
+            result = float(value)
+        except ValueError:
+            return None
+    if not math.isfinite(result) or result <= 0:
+        return None
+    return result
+
+
+def _probe_video_info(path: Path) -> VideoProbeInfo:
     probe_cmd = [
         "ffprobe",
         "-v",
@@ -74,7 +107,9 @@ def _load_video_dimensions(path: Path) -> tuple[int, int]:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height",
+        "stream=width,height,avg_frame_rate,duration",
+        "-show_entries",
+        "format=duration",
         "-of",
         "json",
         os.fspath(path),
@@ -104,7 +139,28 @@ def _load_video_dimensions(path: Path) -> tuple[int, int]:
         raise RuntimeError(f"Invalid width/height metadata for '{path.name}'.")
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Non-positive dimensions reported for '{path.name}'.")
-    return width, height
+    frame_rate = None
+    try:
+        frame_rate = _parse_ratio(stream.get("avg_frame_rate"))  # type: ignore[arg-type]
+    except AttributeError:
+        frame_rate = None
+    duration: float | None = None
+    raw_stream_duration = stream.get("duration") if isinstance(stream, dict) else None
+    raw_format = data.get("format")
+    raw_format_duration = None
+    if isinstance(raw_format, dict):
+        raw_format_duration = raw_format.get("duration")
+    for candidate in (raw_stream_duration, raw_format_duration):
+        if candidate is None:
+            continue
+        try:
+            duration_val = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(duration_val) and duration_val > 0:
+            duration = duration_val
+            break
+    return VideoProbeInfo(width=width, height=height, duration=duration, frame_rate=frame_rate)
 
 
 def _load_crop_metadata(path: Path) -> dict[str, object] | None:
@@ -117,8 +173,8 @@ def _load_crop_metadata(path: Path) -> dict[str, object] | None:
         return None
 
 
-def _determine_crop_region(video_path: Path) -> CropRegion:
-    width, height = _load_video_dimensions(video_path)
+def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion:
+    width, height = info.width, info.height
     metadata = _load_crop_metadata(video_path.with_suffix(".json"))
     crop_metadata: CropMetadata | None = None
     if isinstance(metadata, dict):
@@ -147,15 +203,56 @@ def _determine_crop_region(video_path: Path) -> CropRegion:
     return CropRegion(x=x, y=y, size=size)
 
 
+def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
+    if frame_rate is None or frame_rate <= 0:
+        return max(0.0, frame_value) / 1000.0
+    return max(0.0, frame_value) / frame_rate
+
+
+def _determine_trim_range(video_path: Path, info: VideoProbeInfo) -> tuple[float, float] | None:
+    metadata = _load_crop_metadata(video_path.with_suffix(".json"))
+    if not isinstance(metadata, dict):
+        return None
+    square = metadata.get("square_cropping")
+    if not isinstance(square, dict):
+        return None
+
+    def _extract(point: object) -> float | None:
+        if not isinstance(point, dict):
+            return None
+        frame_value = point.get("frame")
+        if frame_value is None:
+            return None
+        try:
+            frame_float = float(frame_value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(frame_float):
+            return None
+        return _frame_to_seconds(frame_float, info.frame_rate)
+
+    start = _extract(square.get("in_point"))
+    end = _extract(square.get("out_point"))
+    if start is None or end is None:
+        return None
+    if info.duration is not None:
+        start = max(0.0, min(start, info.duration))
+        end = max(start, min(end, info.duration))
+    if end <= start:
+        return None
+    return start, end
+
+
 def _build_encoding_command(
     source: Path,
     destination: Path,
     crop_region: CropRegion,
+    trim_range: tuple[float, float] | None,
 ) -> list[str]:
     filter_chain = ",".join(
         [crop_region.filter_expression, "scale=480:480:flags=lanczos", "setsar=1"]
     )
-    return [
+    command = [
         "ffmpeg",
         "-y",
         "-i",
@@ -205,14 +302,25 @@ def _build_encoding_command(
         "-shortest",
         os.fspath(destination),
     ]
+    if trim_range is not None:
+        start, end = trim_range
+        duration = max(0.0, end - start)
+        if duration > 0:
+            insertion_index = command.index("-vf")
+            command[insertion_index:insertion_index] = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}"]
+    return command
 
 
 def _encode_segments(video_files: Sequence[Path], tmpdir: Path) -> list[Path]:
     segments: list[Path] = []
+    total = len(video_files)
     for index, video_path in enumerate(video_files, start=1):
-        crop_region = _determine_crop_region(video_path)
+        info = _probe_video_info(video_path)
+        crop_region = _determine_crop_region(video_path, info)
+        trim_range = _determine_trim_range(video_path, info)
         segment_path = tmpdir / f"segment_{index:03d}.mp4"
-        cmd = _build_encoding_command(video_path, segment_path, crop_region)
+        print(f"[{index}/{total}] Encoding {video_path.name}...", flush=True)
+        cmd = _build_encoding_command(video_path, segment_path, crop_region, trim_range)
         process = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if process.returncode != 0:
             raise RuntimeError(
@@ -235,6 +343,7 @@ def _concat_segments(segments: Sequence[Path], output_path: Path) -> None:
         for segment in segments:
             handle.write(f"file '{segment.as_posix()}'\n")
     try:
+        print("Concatenating segments...", flush=True)
         cmd = [
             "ffmpeg",
             "-y",
