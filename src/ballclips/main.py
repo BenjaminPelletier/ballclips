@@ -319,6 +319,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_initial_region: CropRegion | None = None
         self._crop_edit_tolerance = 1e-3
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
+        self._video_trim_ranges: dict[Path, tuple[float, float]] = {}
         self._crop_region_dirty = False
         self._current_video_file: Path | None = None
         self._discoverer: GstPbutilsTypes.Discoverer | None = None  # type: ignore[attr-defined]
@@ -402,6 +403,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._current_video_pixel_size = self._probe_video_size(video_file)
         self._ensure_crop_defaults(video_file)
         self._crop_region_dirty = False
+        trim_range = self._video_trim_ranges.get(video_file)
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
         self._title_label.set_text(video_file.name)
@@ -415,9 +417,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._duration_ns = 0
         self._progress_adjustment.set_upper(1.0)
         self._set_progress_value(0.0)
-        self._trim_in_seconds = 0.0
-        self._trim_out_seconds = 0.0
-        self._pending_trim_reset = True
+        if trim_range is not None:
+            trim_in, trim_out = trim_range
+            trim_in = max(0.0, float(trim_in))
+            trim_out = max(trim_in, float(trim_out))
+            self._trim_in_seconds = trim_in
+            self._trim_out_seconds = trim_out
+            self._pending_trim_reset = False
+        else:
+            self._trim_in_seconds = 0.0
+            self._trim_out_seconds = 0.0
+            self._pending_trim_reset = True
         self._trim_area.queue_draw()
         self._crop_overlay.queue_draw()
 
@@ -687,6 +697,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         in_region = default_in
         out_region = default_out
         metadata = self._load_video_metadata(video_file)
+        trim_updated = False
         if metadata is not None:
             square_data = metadata.square_cropping
             converted_in = self._square_point_to_crop_region(square_data.in_point)
@@ -695,6 +706,16 @@ class PlayerWindow(Gtk.ApplicationWindow):
             converted_out = self._square_point_to_crop_region(square_data.out_point)
             if converted_out is not None:
                 out_region = converted_out
+            trim_in = self._square_point_to_trim_seconds(square_data.in_point)
+            trim_out = self._square_point_to_trim_seconds(square_data.out_point)
+            if trim_in is not None and trim_out is not None:
+                trim_in = max(0.0, trim_in)
+                trim_out = max(trim_in, trim_out)
+                self._video_trim_ranges[video_file] = (trim_in, trim_out)
+                trim_updated = True
+
+        if not trim_updated:
+            self._video_trim_ranges.pop(video_file, None)
 
         self._video_crop_regions[video_file] = {
             "in": in_region.clamped(),
@@ -736,10 +757,13 @@ class PlayerWindow(Gtk.ApplicationWindow):
         metadata_path = self._metadata_path(video_file)
         in_region = self._video_crop_regions[video_file]["in"].clamped()
         out_region = self._video_crop_regions[video_file]["out"].clamped()
+        trim_in = max(0.0, self._trim_in_seconds)
+        trim_out = max(trim_in, self._trim_out_seconds)
+        self._video_trim_ranges[video_file] = (trim_in, trim_out)
         metadata = VideoMetadata(
             square_cropping=SquareCroppingData(
-                in_point=self._crop_region_to_square_point(in_region, self._trim_in_seconds),
-                out_point=self._crop_region_to_square_point(out_region, self._trim_out_seconds),
+                in_point=self._crop_region_to_square_point(in_region, trim_in),
+                out_point=self._crop_region_to_square_point(out_region, trim_out),
             )
         )
         try:
@@ -796,6 +820,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
         size_ratio = float(size) / min_dimension
         return CropRegion(center_x, center_y, size_ratio).clamped()
 
+    def _square_point_to_trim_seconds(self, point: SquareCroppingPoint) -> float | None:
+        frame = getattr(point, "frame", None)
+        if not isinstance(frame, (int, float)):
+            return None
+        return self._frame_to_seconds(float(frame))
+
     def _seconds_to_frame(self, seconds: float) -> int:
         rate = self._current_video_frame_rate
         if rate is None:
@@ -805,6 +835,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
             return int(round(seconds * 1000.0))
         fps = num / den
         return int(round(seconds * fps))
+
+    def _frame_to_seconds(self, frame: float) -> float:
+        rate = self._current_video_frame_rate
+        if rate is None:
+            return max(0.0, frame) / 1000.0
+        num, den = rate
+        if num <= 0 or den <= 0:
+            return max(0.0, frame) / 1000.0
+        fps = num / den
+        if fps <= 0:
+            return max(0.0, frame) / 1000.0
+        return max(0.0, frame) / fps
 
     def _get_video_display_rect(
         self, width: int, height: int
