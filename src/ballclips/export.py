@@ -284,22 +284,33 @@ def _determine_crop_filter(
     if not isinstance(square, dict):
         return fallback_spec
 
+    def _fail(reason: str) -> RuntimeError:
+        return RuntimeError(
+            f"{video_path.name} has square_cropping metadata but {reason}"
+        )
+
     in_point_obj = square.get("in_point")
     out_point_obj = square.get("out_point")
-    if not isinstance(in_point_obj, dict) or not isinstance(out_point_obj, dict):
-        return fallback_spec
+    if not isinstance(in_point_obj, dict):
+        raise _fail("is missing a valid 'in_point' entry.")
+    if not isinstance(out_point_obj, dict):
+        raise _fail("is missing a valid 'out_point' entry.")
 
     in_metadata = CropMetadata.from_point(info.width, info.height, in_point_obj)
     out_metadata = CropMetadata.from_point(info.width, info.height, out_point_obj)
-    if in_metadata is None or out_metadata is None:
-        return fallback_spec
+    if in_metadata is None:
+        raise _fail("its 'in_point' metadata is incomplete or invalid.")
+    if out_metadata is None:
+        raise _fail("its 'out_point' metadata is incomplete or invalid.")
 
     start_time = _extract_point_time(in_point_obj, info.frame_rate)
     end_time = _extract_point_time(out_point_obj, info.frame_rate)
-    if start_time is None or end_time is None:
-        return fallback_spec
+    if start_time is None:
+        raise _fail("its 'in_point' does not define a usable frame/time.")
+    if end_time is None:
+        raise _fail("its 'out_point' does not define a usable frame/time.")
     if end_time <= start_time:
-        return fallback_spec
+        raise _fail("its 'out_point' occurs on or before its 'in_point'.")
 
     start_x, start_y, start_size = _sanitize_crop_metadata(
         in_metadata, info.width, info.height
@@ -349,7 +360,7 @@ def _determine_crop_filter(
     x_expr = _escape_ffmpeg_expr(f"({start_x_str})+({delta_x})*{progress_expr}")
     y_expr = _escape_ffmpeg_expr(f"({start_y_str})+({delta_y})*{progress_expr}")
 
-    expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}"
+    expression = f"crop={size_expr}:{size_expr}:{x_expr}:{y_expr}:eval=frame"
     return CropFilterSpec(expression=expression, time_variant=True)
 
 
