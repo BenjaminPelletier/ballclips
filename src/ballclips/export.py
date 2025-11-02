@@ -239,6 +239,51 @@ def _escape_ffmpeg_expr(expression: str) -> str:
     return expression.replace(",", r"\,")
 
 
+def _build_combined_progress_expression(
+    frame_symbol: str,
+    time_symbol: str,
+    offset_frames_str: str,
+    last_transition_frame_str: str,
+    denom_frames_str: str,
+    offset_str: str,
+    end_offset_str: str,
+    frame_interval_str: str,
+    duration_str: str,
+) -> str:
+    """Construct a progress expression that blends frame and time estimates."""
+
+    frame_progress_expr = "".join(
+        [
+            f"if(lte({frame_symbol},{offset_frames_str}),0,",
+            f"min(1,if(gte({frame_symbol},{last_transition_frame_str}),1,({frame_symbol}-({offset_frames_str}))/{denom_frames_str}))",
+            ")",
+        ]
+    )
+
+    time_progress_expr = "".join(
+        [
+            f"if(lte({time_symbol},{offset_str}),0,",
+            f"min(1,if(gte({time_symbol},{end_offset_str}),1,(({time_symbol}-({offset_str}))+({frame_interval_str}))/{duration_str}))",
+            ")",
+        ]
+    )
+
+    return "".join(
+        [
+            "(",
+            "(",
+            frame_progress_expr,
+            ")+(",
+            time_progress_expr,
+            ")+abs((",
+            frame_progress_expr,
+            ")-(",
+            time_progress_expr,
+            ")))/2",
+        ]
+    )
+
+
 def _sanitize_crop_metadata(
     metadata: CropMetadata, width: int, height: int
 ) -> tuple[float, float, float]:
@@ -351,22 +396,6 @@ def _determine_crop_filter(
     last_transition_frame_str = str(last_transition_frame)
     denom_frames_str = str(denom_frames)
 
-    frame_progress_expr = "".join(
-        [
-            f"if(lte(n,{offset_frames_str}),0,",
-            f"min(1,if(gte(n,{last_transition_frame_str}),1,(n-({offset_frames_str}))/{denom_frames_str}))",
-            ")",
-        ]
-    )
-
-    time_progress_expr = "".join(
-        [
-            f"if(lte(t,{offset_str}),0,",
-            f"min(1,if(gte(t,{end_offset_str}),1,((t-({offset_str}))+({frame_interval_str}))/{duration_str}))",
-            ")",
-        ]
-    )
-
     # Combine both time- and frame-based progress estimates so that either can
     # drive the interpolation. This allows videos with valid timestamps to rely
     # on `t`, while sources lacking them (or whose timestamps collapse to a
@@ -375,19 +404,28 @@ def _determine_crop_filter(
     # value can be done arithmetically without introducing additional functions
     # that require comma-separated arguments (which become difficult to escape
     # once embedded inside the filter graph).
-    progress_expr = "".join(
-        [
-            "(",
-            "(",
-            frame_progress_expr,
-            ")+(",
-            time_progress_expr,
-            ")+abs((",
-            frame_progress_expr,
-            ")-(",
-            time_progress_expr,
-            ")))/2",
-        ]
+    progress_expr = _build_combined_progress_expression(
+        "n",
+        "t",
+        offset_frames_str,
+        last_transition_frame_str,
+        denom_frames_str,
+        offset_str,
+        end_offset_str,
+        frame_interval_str,
+        duration_str,
+    )
+
+    zoompan_progress_expr = _build_combined_progress_expression(
+        "on",
+        "time",
+        offset_frames_str,
+        last_transition_frame_str,
+        denom_frames_str,
+        offset_str,
+        end_offset_str,
+        frame_interval_str,
+        duration_str,
     )
 
     delta_size = _format_ffmpeg_float(end_size - start_size)
@@ -395,6 +433,7 @@ def _determine_crop_filter(
     start_size_str = _format_ffmpeg_float(start_size)
 
     size_expr_raw = f"({start_size_str})+({delta_size})*{progress_expr}"
+    zoom_size_expr_raw = f"({start_size_str})+({delta_size})*{zoompan_progress_expr}"
 
     base_size = max(start_size, end_size)
     base_size_str = _format_ffmpeg_float(base_size)
@@ -432,7 +471,7 @@ def _determine_crop_filter(
     )
 
     zoom_expr = _escape_ffmpeg_expr(
-        f"({base_size_str})/({size_expr_raw})"
+        f"({base_size_str})/({zoom_size_expr_raw})"
     )
 
     crop_filter = (
