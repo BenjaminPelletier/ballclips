@@ -27,6 +27,8 @@ from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
 
 from implicitdict import ImplicitDict
 
+from .metadata import SquareCroppingData, SquareCroppingPoint, VideoMetadata
+
 if _GST_PBUTILS_AVAILABLE:
     try:
         from gi.repository import GstPbutils  # type: ignore
@@ -75,22 +77,6 @@ class CropRegion:
         left = max(offset_x, min(left, offset_x + width - size_px))
         top = max(offset_y, min(top, offset_y + height - size_px))
         return left, top, size_px
-
-
-class SquareCroppingPoint(ImplicitDict):
-    frame: int
-    u: int
-    v: int
-    size: int
-
-
-class SquareCroppingData(ImplicitDict):
-    in_point: SquareCroppingPoint
-    out_point: SquareCroppingPoint
-
-
-class VideoMetadata(ImplicitDict):
-    square_cropping: SquareCroppingData
 
 
 def _coerce_fraction(value: object) -> tuple[int, int] | None:

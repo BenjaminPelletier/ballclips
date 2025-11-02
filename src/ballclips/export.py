@@ -14,6 +14,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
 
+from implicitdict import ImplicitDict
+
+from .metadata import SquareCroppingPoint, VideoMetadata
+
 
 @dataclass
 class CropMetadata:
@@ -28,15 +32,15 @@ class CropMetadata:
         cls,
         width: int,
         height: int,
-        points: Iterable[dict[str, object]],
+        points: Iterable[SquareCroppingPoint],
     ) -> "CropMetadata" | None:
         valid: list[tuple[float, float, float]] = []
         for point in points:
             try:
-                u = float(point["u"])  # type: ignore[index]
-                v = float(point["v"])  # type: ignore[index]
-                size = float(point["size"])  # type: ignore[index]
-            except (KeyError, TypeError, ValueError):
+                u = float(point.u)
+                v = float(point.v)
+                size = float(point.size)
+            except (AttributeError, TypeError, ValueError):
                 continue
             if math.isfinite(u) and math.isfinite(v) and math.isfinite(size):
                 valid.append((u, v, size))
@@ -57,7 +61,7 @@ class CropMetadata:
         cls,
         width: int,
         height: int,
-        point: dict[str, object],
+        point: SquareCroppingPoint,
     ) -> "CropMetadata" | None:
         return cls.from_points(width, height, [point])
 
@@ -181,29 +185,33 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
     return VideoProbeInfo(width=width, height=height, duration=duration, frame_rate=frame_rate)
 
 
-def _load_crop_metadata(path: Path) -> dict[str, object] | None:
+def _load_video_metadata(path: Path) -> VideoMetadata | None:
     if not path.exists():
         return None
     try:
         with path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+            raw_metadata = json.load(handle)
     except (OSError, json.JSONDecodeError):
+        return None
+    try:
+        return ImplicitDict.parse(raw_metadata, VideoMetadata)
+    except (TypeError, ValueError):
         return None
 
 
 def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion:
     width, height = info.width, info.height
-    metadata = _load_crop_metadata(video_path.with_suffix(".json"))
+    metadata = _load_video_metadata(video_path.with_suffix(".json"))
     crop_metadata: CropMetadata | None = None
-    if isinstance(metadata, dict):
-        square = metadata.get("square_cropping")
-        if isinstance(square, dict):
-            points: list[dict[str, object]] = []
-            for key in ("in_point", "out_point"):
-                value = square.get(key)
-                if isinstance(value, dict):
-                    points.append(value)
-            crop_metadata = CropMetadata.from_points(width, height, points)
+    if metadata is not None:
+        crop_metadata = CropMetadata.from_points(
+            width,
+            height,
+            [
+                metadata.square_cropping.in_point,
+                metadata.square_cropping.out_point,
+            ],
+        )
     if crop_metadata is None:
         size = min(width, height)
         x = (width - size) // 2
@@ -299,11 +307,9 @@ def _sanitize_crop_metadata(
 
 
 def _extract_point_time(
-    point: dict[str, object], frame_rate: float | None
+    point: SquareCroppingPoint, frame_rate: float | None
 ) -> float | None:
-    frame_value = point.get("frame")
-    if frame_value is None:
-        return None
+    frame_value = point.frame
     try:
         frame_float = float(frame_value)
     except (TypeError, ValueError):
@@ -324,11 +330,8 @@ def _determine_crop_filter(
         time_variant=False,
     )
 
-    metadata = _load_crop_metadata(video_path.with_suffix(".json"))
-    if not isinstance(metadata, dict):
-        return fallback_spec
-    square = metadata.get("square_cropping")
-    if not isinstance(square, dict):
+    metadata = _load_video_metadata(video_path.with_suffix(".json"))
+    if metadata is None:
         return fallback_spec
 
     def _fail(reason: str) -> RuntimeError:
@@ -336,12 +339,8 @@ def _determine_crop_filter(
             f"{video_path.name} has square_cropping metadata but {reason}"
         )
 
-    in_point_obj = square.get("in_point")
-    out_point_obj = square.get("out_point")
-    if not isinstance(in_point_obj, dict):
-        raise _fail("is missing a valid 'in_point' entry.")
-    if not isinstance(out_point_obj, dict):
-        raise _fail("is missing a valid 'out_point' entry.")
+    in_point_obj = metadata.square_cropping.in_point
+    out_point_obj = metadata.square_cropping.out_point
 
     in_metadata = CropMetadata.from_point(info.width, info.height, in_point_obj)
     out_metadata = CropMetadata.from_point(info.width, info.height, out_point_obj)
@@ -499,29 +498,12 @@ def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
 
 
 def _determine_trim_range(video_path: Path, info: VideoProbeInfo) -> tuple[float, float] | None:
-    metadata = _load_crop_metadata(video_path.with_suffix(".json"))
-    if not isinstance(metadata, dict):
-        return None
-    square = metadata.get("square_cropping")
-    if not isinstance(square, dict):
+    metadata = _load_video_metadata(video_path.with_suffix(".json"))
+    if metadata is None:
         return None
 
-    def _extract(point: object) -> float | None:
-        if not isinstance(point, dict):
-            return None
-        frame_value = point.get("frame")
-        if frame_value is None:
-            return None
-        try:
-            frame_float = float(frame_value)
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(frame_float):
-            return None
-        return _frame_to_seconds(frame_float, info.frame_rate)
-
-    start = _extract(square.get("in_point"))
-    end = _extract(square.get("out_point"))
+    start = _extract_point_time(metadata.square_cropping.in_point, info.frame_rate)
+    end = _extract_point_time(metadata.square_cropping.out_point, info.frame_rate)
     if start is None or end is None:
         return None
     if info.duration is not None:
