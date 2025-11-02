@@ -51,3 +51,24 @@ sudo nice -n -5 "$(command -v uv)" run ballclips ~/shared
 ```
 
 To debug video behavior, `export GST_DEBUG=3`.
+
+## Exporting cropped clips
+
+Once you have saved crop metadata alongside your source videos, you can batch
+export them into a single compilation. The `ballclips-export` CLI is published
+with this project, so you can invoke it directly with `uv run`:
+
+```bash
+uv run ballclips-export <path-to-folder-with-videos>
+```
+
+By default the compilation is saved as `ballclips_compilation.mp4` next to the
+input folder. Pass `--output` to choose a different destination or filename and
+`--seed` to make the shuffling of clips deterministic:
+
+```bash
+uv run ballclips-export ~/shared/clips --output ~/exports/my-compilation.mp4 --seed 1234
+```
+
+The export process requires `ffmpeg` to be installed and available on your
+`PATH`.
