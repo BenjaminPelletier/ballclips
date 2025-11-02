@@ -314,7 +314,17 @@ def _determine_crop_filter(
 
     offset_str = _format_ffmpeg_float(offset)
     duration_str = _format_ffmpeg_float(duration)
-    progress_expr = f"min(1,max(0,(t-({offset_str}))/{duration_str}))"
+    end_offset_str = _format_ffmpeg_float(offset + duration)
+    # Guard against frames with missing timestamps (t=NaN) by falling back to the
+    # starting crop window until a valid timestamp is observed.
+    progress_expr = "".join(
+        [
+            "if(isnan(t),0,",
+            f"if(lte(t,{offset_str}),0,",
+            f"if(gte(t,{end_offset_str}),1,(t-({offset_str}))/{duration_str})",
+            "))",
+        ]
+    )
 
     delta_x = _format_ffmpeg_float(end_x - start_x)
     delta_y = _format_ffmpeg_float(end_y - start_y)
