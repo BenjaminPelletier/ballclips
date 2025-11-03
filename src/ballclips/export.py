@@ -286,51 +286,6 @@ def _escape_ffmpeg_expr(expression: str) -> str:
     return expression.replace(",", r"\,")
 
 
-def _build_combined_progress_expression(
-    frame_symbol: str,
-    time_symbol: str,
-    offset_frames_str: str,
-    last_transition_frame_str: str,
-    denom_frames_str: str,
-    offset_str: str,
-    end_offset_str: str,
-    frame_interval_str: str,
-    duration_str: str,
-) -> str:
-    """Construct a progress expression that blends frame and time estimates."""
-
-    frame_progress_expr = "".join(
-        [
-            f"if(lte({frame_symbol},{offset_frames_str}),0,",
-            f"min(1,if(gte({frame_symbol},{last_transition_frame_str}),1,({frame_symbol}-({offset_frames_str}))/{denom_frames_str}))",
-            ")",
-        ]
-    )
-
-    time_progress_expr = "".join(
-        [
-            f"if(lte({time_symbol},{offset_str}),0,",
-            f"min(1,if(gte({time_symbol},{end_offset_str}),1,(({time_symbol}-({offset_str}))+({frame_interval_str}))/{duration_str}))",
-            ")",
-        ]
-    )
-
-    return "".join(
-        [
-            "(",
-            "(",
-            frame_progress_expr,
-            ")+(",
-            time_progress_expr,
-            ")+abs((",
-            frame_progress_expr,
-            ")-(",
-            time_progress_expr,
-            ")))/2",
-        ]
-    )
-
-
 def _validate_crop_metadata(
     metadata: CropMetadata,
     width: int,
@@ -437,48 +392,9 @@ def _determine_crop_filter(
     offset_str = _format_ffmpeg_float(offset)
     duration_str = _format_ffmpeg_float(duration)
 
-    if info.frame_rate is not None and info.frame_rate > 0:
-        frame_interval = 1.0 / info.frame_rate
-    else:
-        frame_interval = 1.0 / 30.0
-    if not math.isfinite(frame_interval) or frame_interval <= 0.0:
-        frame_interval = 1.0 / 30.0
-    frame_step = frame_interval
-    frame_interval = min(frame_interval, duration)
-    frame_interval_str = _format_ffmpeg_float(frame_interval)
-    end_offset = offset + duration
-    end_offset_str = _format_ffmpeg_float(end_offset)
-
-    # Estimate frame-based timings to support sources whose timestamps are missing.
-    offset_frames = 0
-    if frame_step > 0:
-        offset_frames = max(int(math.floor(offset / frame_step)), 0)
-    transition_frames = max(int(math.ceil(duration / frame_step)), 1)
-    last_transition_frame = offset_frames + transition_frames - 1
-    denom_frames = max(transition_frames - 1, 1)
-    offset_frames_str = str(offset_frames)
-    last_transition_frame_str = str(last_transition_frame)
-    denom_frames_str = str(denom_frames)
-
-    # Combine both time- and frame-based progress estimates so that either can
-    # drive the interpolation. This allows videos with valid timestamps to rely
-    # on `t`, while sources lacking them (or whose timestamps collapse to a
-    # constant value) still interpolate using the frame index. Each individual
-    # expression is already clipped to the range [0, 1], so computing the larger
-    # value can be done arithmetically without introducing additional functions
-    # that require comma-separated arguments (which become difficult to escape
-    # once embedded inside the filter graph).
-    progress_expr = _build_combined_progress_expression(
-        "n",
-        "t",
-        offset_frames_str,
-        last_transition_frame_str,
-        denom_frames_str,
-        offset_str,
-        end_offset_str,
-        frame_interval_str,
-        duration_str,
-    )
+    # The input is trimmed to this range, so a single linear interpolation based on
+    # presentation timestamp is sufficient and respects the validated bounds.
+    progress_expr = f"((t)-({offset_str}))/{duration_str}"
 
     start_size_str = _format_ffmpeg_float(start_size)
     end_size_delta = _format_ffmpeg_float(end_size - start_size)
