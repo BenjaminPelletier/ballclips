@@ -462,15 +462,20 @@ def _determine_crop_filter(
         base_size = max(max_right - min_left, max_bottom - min_top)
         base_size = max(base_size, max(start_size, end_size))
 
+        pad_right = max(0.0, base_size - info.width)
+        pad_bottom = max(0.0, base_size - info.height)
+        canvas_width = info.width + pad_right
+        canvas_height = info.height + pad_bottom
+
         min_allowed_left = max(0.0, max_right - base_size)
-        max_allowed_left = min(min_left, info.width - base_size)
+        max_allowed_left = min(min_left, canvas_width - base_size)
         if min_allowed_left - max_allowed_left > 1e-6:
             raise _fail("its crop animation cannot be contained within the video frame.")
         ideal_left = (min_left + max_right - base_size) / 2.0
         base_left = min(max(ideal_left, min_allowed_left), max_allowed_left)
 
         min_allowed_top = max(0.0, max_bottom - base_size)
-        max_allowed_top = min(min_top, info.height - base_size)
+        max_allowed_top = min(min_top, canvas_height - base_size)
         if min_allowed_top - max_allowed_top > 1e-6:
             raise _fail("its crop animation cannot be contained within the video frame.")
         ideal_top = (min_top + max_bottom - base_size) / 2.0
@@ -480,6 +485,13 @@ def _determine_crop_filter(
         base_left_str = _format_ffmpeg_float(base_left)
         base_top_str = _format_ffmpeg_float(base_top)
         crop_filter = f"crop={base_size_str}:{base_size_str}:{base_left_str}:{base_top_str}"
+
+        extra_filters: list[str] = []
+        if pad_right > 1e-6 or pad_bottom > 1e-6:
+            pad_width_str = _format_ffmpeg_float(canvas_width)
+            pad_height_str = _format_ffmpeg_float(canvas_height)
+            pad_filter = f"pad={pad_width_str}:{pad_height_str}:0:0"
+            extra_filters.append(pad_filter)
 
         base_expr_zoom = (
             "on"
@@ -508,7 +520,7 @@ def _determine_crop_filter(
         )
 
         spec = CropFilterSpec(
-            filters=[crop_filter, "fps=30", zoompan_filter],
+            filters=[*extra_filters, crop_filter, "fps=30", zoompan_filter],
             time_variant=True,
             produces_scaled_output=True,
         )

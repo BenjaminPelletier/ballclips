@@ -6,7 +6,19 @@ from implicitdict import ImplicitDict
 
 
 class SquareCroppingPoint(ImplicitDict):
-    """A square cropping sample taken at a specific frame."""
+    """A square cropping sample taken at a specific frame.
+
+    The coordinate system is defined on the encoded video frame (after
+    applying any pixel-aspect ratio from the container but before
+    considering display matrix rotations).  ``u`` and ``v`` identify the
+    horizontal and vertical centre of the crop, in **pixels**, measured
+    from the top-left corner of that encoded frame.  ``size`` is the edge
+    length of the square crop, also in pixels, and is measured along the
+    shorter dimension of the encoded frame so that a value of ``size`` =
+    ``height`` indicates a crop that spans the full vertical extent of a
+    landscape frame.  All values must be finite and ``size`` must be
+    positive.
+    """
 
     frame: int
     u: int
