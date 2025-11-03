@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import shlex
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
@@ -166,6 +167,17 @@ def _extract_rotation(stream: dict) -> int:
                 rotation_value = _parse_rotation_value(entry.get("rotation"))
                 if rotation_value is not None:
                     break
+                raw_text: object = entry.get("side_data")
+                if isinstance(raw_text, str):
+                    match = re.search(
+                        r"rotation\s+of\s+(-?\d+(?:\.\d+)?)\s+degrees",
+                        raw_text,
+                        flags=re.IGNORECASE,
+                    )
+                    if match:
+                        rotation_value = _parse_rotation_value(match.group(1))
+                        if rotation_value is not None:
+                            break
 
     if rotation_value is None or not math.isfinite(rotation_value):
         return 0
@@ -200,6 +212,14 @@ def _parse_ratio(value: str | None) -> float | None:
 
 
 def _probe_video_info(path: Path) -> VideoProbeInfo:
+    show_entries = ":".join(
+        [
+            "stream=width,height,avg_frame_rate,duration,side_data_list",
+            "stream_tags=rotate",
+            "stream_side_data_list=rotation",
+            "format=duration",
+        ]
+    )
     probe_cmd = [
         "ffprobe",
         "-v",
@@ -207,11 +227,7 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,avg_frame_rate,duration,side_data_list",
-        "-show_entries",
-        "stream_tags=rotate",
-        "-show_entries",
-        "format=duration",
+        show_entries,
         "-of",
         "json",
         os.fspath(path),
