@@ -327,6 +327,19 @@ def _extract_point_time(
     return _frame_to_seconds(frame_float, frame_rate)
 
 
+def _extract_point_frame(point: SquareCroppingPoint) -> float | None:
+    """Return the frame index encoded in a cropping point, if valid."""
+
+    frame_value = point.frame
+    try:
+        frame_float = float(frame_value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(frame_float):
+        return None
+    return frame_float
+
+
 def _determine_crop_filter(
     video_path: Path,
     info: VideoProbeInfo,
@@ -385,19 +398,33 @@ def _determine_crop_filter(
         out_metadata, info.width, info.height, "out_point", _fail
     )
 
-    trim_start = trim_range[0] if trim_range is not None else 0.0
-    offset = start_time - trim_start
-    duration = max(end_time - start_time, 1e-6)
+    start_frame = _extract_point_frame(in_point_obj)
+    end_frame = _extract_point_frame(out_point_obj)
+    if start_frame is None:
+        raise _fail("its 'in_point' does not define a usable frame/time.")
+    if end_frame is None:
+        raise _fail("its 'out_point' does not define a usable frame/time.")
 
-    offset_str = _format_ffmpeg_float(offset)
-    duration_str = _format_ffmpeg_float(duration)
+    duration_frames = end_frame - start_frame
+    if duration_frames <= 0:
+        raise _fail("its 'out_point' occurs on or before its 'in_point'.")
 
-    # Guard against ffmpeg's filter graph initialization evaluating expressions before
-    # presentation timestamps are defined by treating NaN timestamps as time zero and
-    # constraining the normalized progress to the [0, 1] range.
-    progress_expr = (
-        f"clip(if(isnan(t),0,((t)-({offset_str}))/{duration_str}),0,1)"
-    )
+    duration_time = end_time - start_time
+    frames_per_second = duration_frames / duration_time
+    if not math.isfinite(frames_per_second) or frames_per_second <= 0:
+        raise _fail("its crop metadata has inconsistent timing information.")
+
+    trim_start_time = trim_range[0] if trim_range is not None else 0.0
+    trim_start_frame = trim_start_time * frames_per_second
+    offset_frames = start_frame - trim_start_frame
+
+    offset_frames_str = _format_ffmpeg_float(offset_frames)
+    duration_frames_str = _format_ffmpeg_float(duration_frames)
+    # Drive interpolation directly from the filter's frame index so initialization
+    # never depends on presentation timestamps and progress increases uniformly with
+    # each frame that passes through the graph.
+    base_expr = "n" if math.isclose(offset_frames, 0.0, abs_tol=1e-9) else f"(n)-({offset_frames_str})"
+    progress_expr = f"clip(({base_expr})/({duration_frames_str}),0,1)"
 
     def _interpolated_expr(start: float, end: float) -> str:
         start_str = _format_ffmpeg_float(start)
