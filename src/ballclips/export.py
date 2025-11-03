@@ -418,26 +418,6 @@ def _determine_crop_filter(
     trim_start_frame = trim_start_time * frames_per_second
     offset_frames = start_frame - trim_start_frame
 
-    offset_frames_str = _format_ffmpeg_float(offset_frames)
-    duration_frames_str = _format_ffmpeg_float(duration_frames)
-    # Drive interpolation directly from the filter's frame index so initialization
-    # never depends on presentation timestamps and progress increases uniformly with
-    # each frame that passes through the graph.
-    base_expr = "n" if math.isclose(offset_frames, 0.0, abs_tol=1e-9) else f"(n)-({offset_frames_str})"
-    progress_expr = f"clip(({base_expr})/({duration_frames_str}),0,1)"
-
-    def _interpolated_expr(start: float, end: float) -> str:
-        start_str = _format_ffmpeg_float(start)
-        delta = end - start
-        if math.isclose(delta, 0.0, abs_tol=1e-9):
-            return start_str
-        delta_str = _format_ffmpeg_float(delta)
-        return f"({start_str})+({delta_str})*{progress_expr}"
-
-    size_expr_raw = _interpolated_expr(start_size, end_size)
-    x_expr_raw = _interpolated_expr(start_x, end_x)
-    y_expr_raw = _interpolated_expr(start_y, end_y)
-
     animated = any(
         not math.isclose(delta, 0.0, abs_tol=1e-9)
         for delta in (
@@ -447,13 +427,91 @@ def _determine_crop_filter(
         )
     )
 
-    crop_filter = (
-        "crop="
-        f"w='{_escape_ffmpeg_expr(size_expr_raw)}':"
-        f"h='{_escape_ffmpeg_expr(size_expr_raw)}':"
-        f"x='{_escape_ffmpeg_expr(x_expr_raw)}':"
-        f"y='{_escape_ffmpeg_expr(y_expr_raw)}'"
-    )
+    if not animated:
+        size_str = _format_ffmpeg_float(start_size)
+        x_str = _format_ffmpeg_float(start_x)
+        y_str = _format_ffmpeg_float(start_y)
+        crop_filter = f"crop={size_str}:{size_str}:{x_str}:{y_str}"
+        spec = CropFilterSpec(
+            filters=[crop_filter, "fps=30", "scale=480:480:flags=lanczos"],
+            time_variant=False,
+            produces_scaled_output=True,
+        )
+    else:
+        offset_frames_str = _format_ffmpeg_float(offset_frames)
+        duration_frames_str = _format_ffmpeg_float(duration_frames)
+
+        def _interpolated_expr(start: float, end: float, progress: str) -> str:
+            start_str = _format_ffmpeg_float(start)
+            delta = end - start
+            if math.isclose(delta, 0.0, abs_tol=1e-9):
+                return start_str
+            delta_str = _format_ffmpeg_float(delta)
+            return f"({start_str})+({delta_str})*{progress}"
+
+        start_right = start_x + start_size
+        end_right = end_x + end_size
+        start_bottom = start_y + start_size
+        end_bottom = end_y + end_size
+
+        min_left = min(start_x, end_x)
+        max_right = max(start_right, end_right)
+        min_top = min(start_y, end_y)
+        max_bottom = max(start_bottom, end_bottom)
+
+        base_size = max(max_right - min_left, max_bottom - min_top)
+        base_size = max(base_size, max(start_size, end_size))
+
+        min_allowed_left = max(0.0, max_right - base_size)
+        max_allowed_left = min(min_left, info.width - base_size)
+        if min_allowed_left - max_allowed_left > 1e-6:
+            raise _fail("its crop animation cannot be contained within the video frame.")
+        ideal_left = (min_left + max_right - base_size) / 2.0
+        base_left = min(max(ideal_left, min_allowed_left), max_allowed_left)
+
+        min_allowed_top = max(0.0, max_bottom - base_size)
+        max_allowed_top = min(min_top, info.height - base_size)
+        if min_allowed_top - max_allowed_top > 1e-6:
+            raise _fail("its crop animation cannot be contained within the video frame.")
+        ideal_top = (min_top + max_bottom - base_size) / 2.0
+        base_top = min(max(ideal_top, min_allowed_top), max_allowed_top)
+
+        base_size_str = _format_ffmpeg_float(base_size)
+        base_left_str = _format_ffmpeg_float(base_left)
+        base_top_str = _format_ffmpeg_float(base_top)
+        crop_filter = f"crop={base_size_str}:{base_size_str}:{base_left_str}:{base_top_str}"
+
+        base_expr_zoom = (
+            "on"
+            if math.isclose(offset_frames, 0.0, abs_tol=1e-9)
+            else f"(on)-({offset_frames_str})"
+        )
+        progress_zoom = f"clip(({base_expr_zoom})/({duration_frames_str}),0,1)"
+
+        rel_start_x = start_x - base_left
+        rel_end_x = end_x - base_left
+        rel_start_y = start_y - base_top
+        rel_end_y = end_y - base_top
+
+        size_expr_raw = _interpolated_expr(start_size, end_size, progress_zoom)
+        x_expr_raw = _interpolated_expr(rel_start_x, rel_end_x, progress_zoom)
+        y_expr_raw = _interpolated_expr(rel_start_y, rel_end_y, progress_zoom)
+
+        zoom_expr_raw = f"({base_size_str})/({size_expr_raw})"
+
+        zoompan_filter = (
+            "zoompan="
+            f"z='{_escape_ffmpeg_expr(zoom_expr_raw)}':"
+            f"x='{_escape_ffmpeg_expr(x_expr_raw)}':"
+            f"y='{_escape_ffmpeg_expr(y_expr_raw)}':"
+            "d=1:s=480x480:fps=30"
+        )
+
+        spec = CropFilterSpec(
+            filters=[crop_filter, "fps=30", zoompan_filter],
+            time_variant=True,
+            produces_scaled_output=True,
+        )
 
     def _round_rect(x: float, y: float, size: float) -> tuple[int, int, int, int]:
         left = int(round(x))
@@ -469,11 +527,6 @@ def _determine_crop_filter(
             return None
         return value
 
-    spec = CropFilterSpec(
-        filters=[crop_filter, "fps=30", "scale=480:480:flags=lanczos"],
-        time_variant=animated,
-        produces_scaled_output=True,
-    )
     summary = CropSummary(
         width=info.width,
         height=info.height,
