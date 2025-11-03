@@ -13,7 +13,7 @@ import tempfile
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Callable, Iterable, Sequence
 
 from implicitdict import ImplicitDict
 
@@ -50,11 +50,15 @@ class CropMetadata:
         avg_u = sum(p[0] for p in valid) / len(valid)
         avg_v = sum(p[1] for p in valid) / len(valid)
         avg_size = sum(p[2] for p in valid) / len(valid)
-        min_dimension = min(width, height)
-        size_px = max(1.0, min(avg_size, float(min_dimension)))
-        half = size_px / 2.0
-        center_x = max(half, min(avg_u, width - half))
-        center_y = max(half, min(avg_v, height - half))
+        size_px = avg_size
+        center_x = avg_u
+        center_y = avg_v
+        if not (
+            math.isfinite(center_x)
+            and math.isfinite(center_y)
+            and math.isfinite(size_px)
+        ):
+            return None
         return cls(center_x=center_x, center_y=center_y, size=size_px)
 
     @classmethod
@@ -327,18 +331,32 @@ def _build_combined_progress_expression(
     )
 
 
-def _sanitize_crop_metadata(
-    metadata: CropMetadata, width: int, height: int
+def _validate_crop_metadata(
+    metadata: CropMetadata,
+    width: int,
+    height: int,
+    label: str,
+    fail: Callable[[str], RuntimeError],
 ) -> tuple[float, float, float]:
-    size = max(1.0, min(metadata.size, float(min(width, height))))
-    half = size / 2.0
-    center_x = max(half, min(metadata.center_x, width - half))
-    center_y = max(half, min(metadata.center_y, height - half))
-    max_x = width - size
-    max_y = height - size
-    x = max(0.0, min(center_x - half, max_x))
-    y = max(0.0, min(center_y - half, max_y))
-    return x, y, size
+    if not math.isfinite(metadata.size):
+        raise fail(f"its '{label}' crop size is not finite.")
+    if metadata.size <= 0:
+        raise fail(f"its '{label}' crop size is not positive.")
+    if not math.isfinite(metadata.center_x) or not math.isfinite(metadata.center_y):
+        raise fail(f"its '{label}' crop position is not finite.")
+
+    half = metadata.size / 2.0
+    left = metadata.center_x - half
+    top = metadata.center_y - half
+    right = metadata.center_x + half
+    bottom = metadata.center_y + half
+
+    if left < 0 or top < 0 or right > width or bottom > height:
+        raise fail(
+            f"its '{label}' crop window extends outside the video frame ({width}x{height})."
+        )
+
+    return left, top, metadata.size
 
 
 def _extract_point_time(
@@ -405,11 +423,11 @@ def _determine_crop_filter(
     if end_time <= start_time:
         raise _fail("its 'out_point' occurs on or before its 'in_point'.")
 
-    start_x, start_y, start_size = _sanitize_crop_metadata(
-        in_metadata, info.width, info.height
+    start_x, start_y, start_size = _validate_crop_metadata(
+        in_metadata, info.width, info.height, "in_point", _fail
     )
-    end_x, end_y, end_size = _sanitize_crop_metadata(
-        out_metadata, info.width, info.height
+    end_x, end_y, end_size = _validate_crop_metadata(
+        out_metadata, info.width, info.height, "out_point", _fail
     )
 
     trim_start = trim_range[0] if trim_range is not None else 0.0
@@ -462,73 +480,23 @@ def _determine_crop_filter(
         duration_str,
     )
 
-    zoompan_progress_expr = _build_combined_progress_expression(
-        "on",
-        "time",
-        offset_frames_str,
-        last_transition_frame_str,
-        denom_frames_str,
-        offset_str,
-        end_offset_str,
-        frame_interval_str,
-        duration_str,
-    )
-
-    delta_size = _format_ffmpeg_float(end_size - start_size)
-
     start_size_str = _format_ffmpeg_float(start_size)
+    end_size_delta = _format_ffmpeg_float(end_size - start_size)
+    start_x_str = _format_ffmpeg_float(start_x)
+    start_y_str = _format_ffmpeg_float(start_y)
+    delta_x_str = _format_ffmpeg_float(end_x - start_x)
+    delta_y_str = _format_ffmpeg_float(end_y - start_y)
 
-    size_expr_raw = f"({start_size_str})+({delta_size})*{progress_expr}"
-    zoom_size_expr_raw = f"({start_size_str})+({delta_size})*{zoompan_progress_expr}"
-
-    base_size = max(start_size, end_size)
-    base_size_str = _format_ffmpeg_float(base_size)
-    base_half = base_size / 2.0
-    base_half_str = _format_ffmpeg_float(base_half)
-    max_crop_x = max(info.width - base_size, 0.0)
-    max_crop_y = max(info.height - base_size, 0.0)
-    max_crop_x_str = _format_ffmpeg_float(max_crop_x)
-    max_crop_y_str = _format_ffmpeg_float(max_crop_y)
-
-    start_center_x = start_x + (start_size / 2.0)
-    start_center_y = start_y + (start_size / 2.0)
-    end_center_x = end_x + (end_size / 2.0)
-    end_center_y = end_y + (end_size / 2.0)
-    delta_center_x = end_center_x - start_center_x
-    delta_center_y = end_center_y - start_center_y
-
-    start_center_x_str = _format_ffmpeg_float(start_center_x)
-    start_center_y_str = _format_ffmpeg_float(start_center_y)
-    delta_center_x_str = _format_ffmpeg_float(delta_center_x)
-    delta_center_y_str = _format_ffmpeg_float(delta_center_y)
-
-    center_x_expr = (
-        f"({start_center_x_str})+({delta_center_x_str})*{progress_expr}"
-    )
-    center_y_expr = (
-        f"({start_center_y_str})+({delta_center_y_str})*{progress_expr}"
-    )
-
-    base_x_expr = _escape_ffmpeg_expr(
-        f"clip(({center_x_expr})-({base_half_str}),0,{max_crop_x_str})"
-    )
-    base_y_expr = _escape_ffmpeg_expr(
-        f"clip(({center_y_expr})-({base_half_str}),0,{max_crop_y_str})"
-    )
-
-    zoom_expr = _escape_ffmpeg_expr(
-        f"({base_size_str})/({zoom_size_expr_raw})"
-    )
+    size_expr_raw = f"({start_size_str})+({end_size_delta})*{progress_expr}"
+    x_expr_raw = f"({start_x_str})+({delta_x_str})*{progress_expr}"
+    y_expr_raw = f"({start_y_str})+({delta_y_str})*{progress_expr}"
 
     crop_filter = (
-        f"crop=w={base_size_str}:h={base_size_str}:x='{base_x_expr}':y='{base_y_expr}'"
-    )
-    zoompan_filter = (
-        "zoompan="
-        f"z='{zoom_expr}':"
-        "x='(iw-iw/zoom)/2':"
-        "y='(ih-ih/zoom)/2':"
-        "d=1:s=480x480:fps=30"
+        "crop="
+        f"w='{_escape_ffmpeg_expr(size_expr_raw)}':"
+        f"h='{_escape_ffmpeg_expr(size_expr_raw)}':"
+        f"x='{_escape_ffmpeg_expr(x_expr_raw)}':"
+        f"y='{_escape_ffmpeg_expr(y_expr_raw)}'"
     )
 
     def _round_rect(x: float, y: float, size: float) -> tuple[int, int, int, int]:
@@ -546,7 +514,7 @@ def _determine_crop_filter(
         return value
 
     spec = CropFilterSpec(
-        filters=[crop_filter, "fps=30", zoompan_filter],
+        filters=[crop_filter, "fps=30", "scale=480:480:flags=lanczos"],
         time_variant=True,
         produces_scaled_output=True,
     )
