@@ -392,20 +392,24 @@ def _determine_crop_filter(
     offset_str = _format_ffmpeg_float(offset)
     duration_str = _format_ffmpeg_float(duration)
 
-    # The input is trimmed to this range, so a single linear interpolation based on
-    # presentation timestamp is sufficient and respects the validated bounds.
-    progress_expr = f"((t)-({offset_str}))/{duration_str}"
+    # Guard against ffmpeg's filter graph initialization evaluating expressions before
+    # presentation timestamps are defined by treating NaN timestamps as time zero and
+    # constraining the normalized progress to the [0, 1] range.
+    progress_expr = (
+        f"clip(if(isnan(t),0,((t)-({offset_str}))/{duration_str}),0,1)"
+    )
 
-    start_size_str = _format_ffmpeg_float(start_size)
-    end_size_delta = _format_ffmpeg_float(end_size - start_size)
-    start_x_str = _format_ffmpeg_float(start_x)
-    start_y_str = _format_ffmpeg_float(start_y)
-    delta_x_str = _format_ffmpeg_float(end_x - start_x)
-    delta_y_str = _format_ffmpeg_float(end_y - start_y)
+    def _interpolated_expr(start: float, end: float) -> str:
+        start_str = _format_ffmpeg_float(start)
+        delta = end - start
+        if math.isclose(delta, 0.0, abs_tol=1e-9):
+            return start_str
+        delta_str = _format_ffmpeg_float(delta)
+        return f"({start_str})+({delta_str})*{progress_expr}"
 
-    size_expr_raw = f"({start_size_str})+({end_size_delta})*{progress_expr}"
-    x_expr_raw = f"({start_x_str})+({delta_x_str})*{progress_expr}"
-    y_expr_raw = f"({start_y_str})+({delta_y_str})*{progress_expr}"
+    size_expr_raw = _interpolated_expr(start_size, end_size)
+    x_expr_raw = _interpolated_expr(start_x, end_x)
+    y_expr_raw = _interpolated_expr(start_y, end_y)
 
     crop_filter = (
         "crop="
