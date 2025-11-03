@@ -10,6 +10,7 @@ import random
 import subprocess
 import sys
 import tempfile
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -86,6 +87,40 @@ class CropFilterSpec:
     filters: list[str]
     time_variant: bool = False
     produces_scaled_output: bool = False
+
+
+@dataclass
+class CropSummary:
+    """Human-readable summary of the crop that will be applied."""
+
+    width: int
+    height: int
+    start_rect: tuple[int, int, int, int]
+    end_rect: tuple[int, int, int, int]
+    start_frame: int | None = None
+    end_frame: int | None = None
+
+    def format_summary(self) -> str:
+        dims = f"({self.width}x{self.height})"
+        start_str = (
+            f"({self.start_rect[0]}, {self.start_rect[1]})-({self.start_rect[2]}, {self.start_rect[3]})"
+        )
+        end_str = (
+            f"({self.end_rect[0]}, {self.end_rect[1]})-({self.end_rect[2]}, {self.end_rect[3]})"
+        )
+
+        parts: list[str] = [dims, "from", start_str]
+        if self.start_frame is not None:
+            parts.append(f"at frame {self.start_frame}")
+
+        if self.start_rect != self.end_rect or self.start_frame != self.end_frame:
+            parts.extend(["to", end_str])
+            if self.end_frame is not None:
+                parts.append(f"at frame {self.end_frame}")
+        else:
+            parts.append("(static crop)")
+
+        return " ".join(parts)
 
 
 @dataclass
@@ -323,16 +358,28 @@ def _determine_crop_filter(
     video_path: Path,
     info: VideoProbeInfo,
     trim_range: tuple[float, float] | None,
-) -> CropFilterSpec:
+) -> tuple[CropFilterSpec, CropSummary]:
     fallback_region = _determine_crop_region(video_path, info)
     fallback_spec = CropFilterSpec(
         filters=[fallback_region.filter_expression],
         time_variant=False,
     )
+    fallback_rect = (
+        fallback_region.x,
+        fallback_region.y,
+        fallback_region.x + fallback_region.size,
+        fallback_region.y + fallback_region.size,
+    )
+    fallback_summary = CropSummary(
+        width=info.width,
+        height=info.height,
+        start_rect=fallback_rect,
+        end_rect=fallback_rect,
+    )
 
     metadata = _load_video_metadata(video_path.with_suffix(".json"))
     if metadata is None:
-        return fallback_spec
+        return fallback_spec, fallback_summary
 
     def _fail(reason: str) -> RuntimeError:
         return RuntimeError(
@@ -484,11 +531,34 @@ def _determine_crop_filter(
         "d=1:s=480x480:fps=30"
     )
 
-    return CropFilterSpec(
+    def _round_rect(x: float, y: float, size: float) -> tuple[int, int, int, int]:
+        left = int(round(x))
+        top = int(round(y))
+        right = int(round(x + size))
+        bottom = int(round(y + size))
+        return left, top, right, bottom
+
+    def _extract_frame_value(point: SquareCroppingPoint) -> int | None:
+        try:
+            value = int(point.frame)  # type: ignore[attr-defined]
+        except (AttributeError, TypeError, ValueError):
+            return None
+        return value
+
+    spec = CropFilterSpec(
         filters=[crop_filter, "fps=30", zoompan_filter],
         time_variant=True,
         produces_scaled_output=True,
     )
+    summary = CropSummary(
+        width=info.width,
+        height=info.height,
+        start_rect=_round_rect(start_x, start_y, start_size),
+        end_rect=_round_rect(end_x, end_y, end_size),
+        start_frame=_extract_frame_value(in_point_obj),
+        end_frame=_extract_frame_value(out_point_obj),
+    )
+    return spec, summary
 
 
 def _frame_to_seconds(frame_value: float, frame_rate: float | None) -> float:
@@ -587,16 +657,26 @@ def _build_encoding_command(
     return command
 
 
-def _encode_segments(video_files: Sequence[Path], tmpdir: Path) -> list[Path]:
+def _encode_segments(
+    video_files: Sequence[Path], tmpdir: Path, show_ffmpeg: bool = False
+) -> list[Path]:
     segments: list[Path] = []
     total = len(video_files)
     for index, video_path in enumerate(video_files, start=1):
         info = _probe_video_info(video_path)
         trim_range = _determine_trim_range(video_path, info)
-        crop_filter = _determine_crop_filter(video_path, info, trim_range)
+        crop_filter, crop_summary = _determine_crop_filter(
+            video_path, info, trim_range
+        )
         segment_path = tmpdir / f"segment_{index:03d}.mp4"
-        print(f"[{index}/{total}] Encoding {video_path.name}...", flush=True)
+        summary_text = crop_summary.format_summary()
+        print(
+            f"[{index}/{total}] Encoding {video_path.name} {summary_text}...",
+            flush=True,
+        )
         cmd = _build_encoding_command(video_path, segment_path, crop_filter, trim_range)
+        if show_ffmpeg:
+            print(shlex.join(cmd), flush=True)
         process = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if process.returncode != 0:
             raise RuntimeError(
@@ -681,6 +761,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Random seed used to shuffle the video order.",
     )
+    parser.add_argument(
+        "--show-ffmpeg",
+        action="store_true",
+        help="Print the full ffmpeg command for each segment.",
+    )
     return parser
 
 
@@ -691,6 +776,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     folder: Path = args.folder
     output_path: Path = args.output
     seed = args.seed
+    show_ffmpeg: bool = args.show_ffmpeg
 
     video_files = _list_videos(folder)
     if seed is not None:
@@ -700,7 +786,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir_str:
         tmpdir = Path(tmpdir_str)
-        segments = _encode_segments(video_files, tmpdir)
+        segments = _encode_segments(video_files, tmpdir, show_ffmpeg=show_ffmpeg)
         _concat_segments(segments, output_path)
 
     print(f"Created {output_path} from {len(video_files)} videos.")
