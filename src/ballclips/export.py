@@ -438,12 +438,22 @@ def _determine_crop_filter(
     x_expr_raw = _interpolated_expr(start_x, end_x)
     y_expr_raw = _interpolated_expr(start_y, end_y)
 
+    animated = any(
+        not math.isclose(delta, 0.0, abs_tol=1e-9)
+        for delta in (
+            end_size - start_size,
+            end_x - start_x,
+            end_y - start_y,
+        )
+    )
+
     crop_filter = (
         "crop="
         f"w='{_escape_ffmpeg_expr(size_expr_raw)}':"
         f"h='{_escape_ffmpeg_expr(size_expr_raw)}':"
         f"x='{_escape_ffmpeg_expr(x_expr_raw)}':"
         f"y='{_escape_ffmpeg_expr(y_expr_raw)}'"
+        + (":eval=frame" if animated else "")
     )
 
     def _round_rect(x: float, y: float, size: float) -> tuple[int, int, int, int]:
@@ -462,7 +472,7 @@ def _determine_crop_filter(
 
     spec = CropFilterSpec(
         filters=[crop_filter, "fps=30", "scale=480:480:flags=lanczos"],
-        time_variant=True,
+        time_variant=animated,
         produces_scaled_output=True,
     )
     summary = CropSummary(
