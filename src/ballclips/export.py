@@ -464,8 +464,23 @@ def _determine_crop_filter(
 
         pad_right = max(0.0, base_size - info.width)
         pad_bottom = max(0.0, base_size - info.height)
+
         canvas_width = info.width + pad_right
         canvas_height = info.height + pad_bottom
+
+        min_canvas_width = info.width
+        min_canvas_height = info.height
+
+        if base_size > info.width:
+            min_canvas_width = max(min_canvas_width, info.height)
+        if base_size > info.height:
+            min_canvas_height = max(min_canvas_height, info.width)
+
+        canvas_width = max(canvas_width, min_canvas_width)
+        canvas_height = max(canvas_height, min_canvas_height)
+
+        pad_right = max(0.0, canvas_width - info.width)
+        pad_bottom = max(0.0, canvas_height - info.height)
 
         min_allowed_left = max(0.0, max_right - base_size)
         max_allowed_left = min(min_left, canvas_width - base_size)
