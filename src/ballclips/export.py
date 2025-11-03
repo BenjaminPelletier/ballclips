@@ -135,6 +135,45 @@ class VideoProbeInfo:
     height: int
     duration: float | None
     frame_rate: float | None
+    rotation: int = 0
+    coded_width: int = 0
+    coded_height: int = 0
+
+
+def _extract_rotation(stream: dict) -> int:
+    """Extract the display rotation (in degrees) from an ffprobe stream entry."""
+
+    def _parse_rotation_value(value: object) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    rotation_value: float | None = None
+
+    tags = stream.get("tags")
+    if isinstance(tags, dict):
+        rotation_value = _parse_rotation_value(tags.get("rotate"))
+
+    if rotation_value is None:
+        side_data = stream.get("side_data_list")
+        if isinstance(side_data, list):
+            for entry in side_data:
+                if not isinstance(entry, dict):
+                    continue
+                rotation_value = _parse_rotation_value(entry.get("rotation"))
+                if rotation_value is not None:
+                    break
+
+    if rotation_value is None or not math.isfinite(rotation_value):
+        return 0
+
+    # Normalize to the nearest 90-degree increment to avoid tiny floating errors.
+    normalized = int(round(rotation_value / 90.0)) * 90
+    normalized %= 360
+    return normalized
 
 
 def _parse_ratio(value: str | None) -> float | None:
@@ -168,7 +207,9 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=width,height,avg_frame_rate,duration",
+        "stream=width,height,avg_frame_rate,duration,side_data_list",
+        "-show_entries",
+        "stream_tags=rotate",
         "-show_entries",
         "format=duration",
         "-of",
@@ -200,6 +241,10 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         raise RuntimeError(f"Invalid width/height metadata for '{path.name}'.")
     if width <= 0 or height <= 0:
         raise RuntimeError(f"Non-positive dimensions reported for '{path.name}'.")
+    rotation = _extract_rotation(stream)
+    display_width, display_height = width, height
+    if rotation % 180 != 0:
+        display_width, display_height = height, width
     frame_rate = None
     try:
         frame_rate = _parse_ratio(stream.get("avg_frame_rate"))  # type: ignore[arg-type]
@@ -221,7 +266,15 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         if math.isfinite(duration_val) and duration_val > 0:
             duration = duration_val
             break
-    return VideoProbeInfo(width=width, height=height, duration=duration, frame_rate=frame_rate)
+    return VideoProbeInfo(
+        width=display_width,
+        height=display_height,
+        duration=duration,
+        frame_rate=frame_rate,
+        rotation=rotation,
+        coded_width=width,
+        coded_height=height,
+    )
 
 
 def _load_video_metadata(path: Path) -> VideoMetadata | None:
@@ -238,6 +291,41 @@ def _load_video_metadata(path: Path) -> VideoMetadata | None:
         return None
 
 
+def _convert_crop_metadata_to_display(
+    metadata: CropMetadata, info: VideoProbeInfo
+) -> CropMetadata:
+    rotation = info.rotation % 360
+    if rotation == 0:
+        return metadata
+
+    coded_width = info.coded_width or info.width
+    coded_height = info.coded_height or info.height
+
+    center_x = float(metadata.center_x)
+    center_y = float(metadata.center_y)
+    size = float(metadata.size)
+
+    if rotation == 90:
+        new_center_x = center_y
+        new_center_y = coded_width - center_x
+    elif rotation == 180:
+        new_center_x = coded_width - center_x
+        new_center_y = coded_height - center_y
+    elif rotation == 270:
+        new_center_x = coded_height - center_y
+        new_center_y = center_x
+    else:
+        # Unexpected rotation (not a right angle); leave metadata unchanged.
+        return metadata
+
+    display_width = float(info.width)
+    display_height = float(info.height)
+    new_center_x = max(0.0, min(new_center_x, display_width))
+    new_center_y = max(0.0, min(new_center_y, display_height))
+
+    return CropMetadata(center_x=new_center_x, center_y=new_center_y, size=size)
+
+
 def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion:
     width, height = info.width, info.height
     metadata = _load_video_metadata(video_path.with_suffix(".json"))
@@ -251,6 +339,8 @@ def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion
                 metadata.square_cropping.out_point,
             ],
         )
+    if crop_metadata is not None:
+        crop_metadata = _convert_crop_metadata_to_display(crop_metadata, info)
     if crop_metadata is None:
         size = min(width, height)
         x = (width - size) // 2
@@ -381,6 +471,9 @@ def _determine_crop_filter(
         raise _fail("its 'in_point' metadata is incomplete or invalid.")
     if out_metadata is None:
         raise _fail("its 'out_point' metadata is incomplete or invalid.")
+
+    in_metadata = _convert_crop_metadata_to_display(in_metadata, info)
+    out_metadata = _convert_crop_metadata_to_display(out_metadata, info)
 
     start_time = _extract_point_time(in_point_obj, info.frame_rate)
     end_time = _extract_point_time(out_point_obj, info.frame_rate)
