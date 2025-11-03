@@ -211,27 +211,25 @@ def _parse_ratio(value: str | None) -> float | None:
     return result
 
 
-def _probe_video_info(path: Path) -> VideoProbeInfo:
-    show_entries = ":".join(
-        [
-            "stream=width,height,avg_frame_rate,duration,side_data_list",
-            "stream_tags=rotate",
-            "stream_side_data_list=rotation",
-            "format=duration",
-        ]
-    )
+def _debug_print(verbose: bool, message: str) -> None:
+    if verbose:
+        print(f"[debug] {message}", flush=True)
+
+
+def _probe_video_info(path: Path, *, verbose: bool = False) -> VideoProbeInfo:
     probe_cmd = [
         "ffprobe",
         "-v",
         "error",
         "-select_streams",
         "v:0",
-        "-show_entries",
-        show_entries,
+        "-show_streams",
+        "-show_format",
         "-of",
         "json",
         os.fspath(path),
     ]
+    _debug_print(verbose, f"Running ffprobe: {shlex.join(probe_cmd)}")
     process = subprocess.run(
         probe_cmd,
         capture_output=True,
@@ -242,6 +240,8 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         raise RuntimeError(
             f"Unable to probe '{path.name}': {process.stderr.strip() or process.stdout.strip()}"
         )
+    if verbose and process.stderr:
+        _debug_print(verbose, f"ffprobe stderr: {process.stderr.strip()}")
     try:
         data = json.loads(process.stdout)
     except json.JSONDecodeError as exc:
@@ -282,7 +282,7 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         if math.isfinite(duration_val) and duration_val > 0:
             duration = duration_val
             break
-    return VideoProbeInfo(
+    info = VideoProbeInfo(
         width=display_width,
         height=display_height,
         duration=duration,
@@ -291,6 +291,15 @@ def _probe_video_info(path: Path) -> VideoProbeInfo:
         coded_width=width,
         coded_height=height,
     )
+    _debug_print(
+        verbose,
+        (
+            f"{path.name}: rotation={rotation}°, "
+            f"coded={width}x{height}, display={display_width}x{display_height}, "
+            f"frame_rate={frame_rate or 'unknown'}"
+        ),
+    )
+    return info
 
 
 def _load_video_metadata(path: Path) -> VideoMetadata | None:
@@ -342,7 +351,9 @@ def _convert_crop_metadata_to_display(
     return CropMetadata(center_x=new_center_x, center_y=new_center_y, size=size)
 
 
-def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion:
+def _determine_crop_region(
+    video_path: Path, info: VideoProbeInfo, *, verbose: bool = False
+) -> CropRegion:
     width, height = info.width, info.height
     metadata = _load_video_metadata(video_path.with_suffix(".json"))
     crop_metadata: CropMetadata | None = None
@@ -356,12 +367,24 @@ def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion
             ],
         )
     if crop_metadata is not None:
+        _debug_print(
+            verbose,
+            (
+                f"{video_path.name}: raw metadata center=({crop_metadata.center_x}, "
+                f"{crop_metadata.center_y}), size={crop_metadata.size}"
+            ),
+        )
         crop_metadata = _convert_crop_metadata_to_display(crop_metadata, info)
     if crop_metadata is None:
         size = min(width, height)
         x = (width - size) // 2
         y = (height - size) // 2
-        return CropRegion(x=x, y=y, size=size)
+        region = CropRegion(x=x, y=y, size=size)
+        _debug_print(
+            verbose,
+            f"{video_path.name}: using fallback crop {region.x},{region.y},{region.size}",
+        )
+        return region
     half = crop_metadata.size / 2.0
     x = int(round(crop_metadata.center_x - half))
     y = int(round(crop_metadata.center_y - half))
@@ -371,7 +394,14 @@ def _determine_crop_region(video_path: Path, info: VideoProbeInfo) -> CropRegion
     x = max(0, min(x, max_x))
     y = max(0, min(y, max_y))
     size = max(1, min(size, min(width, height)))
-    return CropRegion(x=x, y=y, size=size)
+    region = CropRegion(x=x, y=y, size=size)
+    _debug_print(
+        verbose,
+        (
+            f"{video_path.name}: display-space crop {region.x},{region.y},{region.size}"
+        ),
+    )
+    return region
 
 
 def _format_ffmpeg_float(value: float) -> str:
@@ -450,8 +480,10 @@ def _determine_crop_filter(
     video_path: Path,
     info: VideoProbeInfo,
     trim_range: tuple[float, float] | None,
+    *,
+    verbose: bool = False,
 ) -> tuple[CropFilterSpec, CropSummary]:
-    fallback_region = _determine_crop_region(video_path, info)
+    fallback_region = _determine_crop_region(video_path, info, verbose=verbose)
     fallback_spec = CropFilterSpec(
         filters=[fallback_region.filter_expression],
         time_variant=False,
@@ -490,6 +522,20 @@ def _determine_crop_filter(
 
     in_metadata = _convert_crop_metadata_to_display(in_metadata, info)
     out_metadata = _convert_crop_metadata_to_display(out_metadata, info)
+    _debug_print(
+        verbose,
+        (
+            f"{video_path.name}: converted in_point center=({in_metadata.center_x}, "
+            f"{in_metadata.center_y}), size={in_metadata.size}"
+        ),
+    )
+    _debug_print(
+        verbose,
+        (
+            f"{video_path.name}: converted out_point center=({out_metadata.center_x}, "
+            f"{out_metadata.center_y}), size={out_metadata.size}"
+        ),
+    )
 
     start_time = _extract_point_time(in_point_obj, info.frame_rate)
     end_time = _extract_point_time(out_point_obj, info.frame_rate)
@@ -671,6 +717,16 @@ def _determine_crop_filter(
         start_frame=_extract_frame_value(in_point_obj),
         end_frame=_extract_frame_value(out_point_obj),
     )
+    if verbose:
+        start_rect = summary.start_rect
+        end_rect = summary.end_rect
+        _debug_print(
+            verbose,
+            (
+                f"{video_path.name}: crop animation from {start_rect} to {end_rect} "
+                f"frames {summary.start_frame}->{summary.end_frame}"
+            ),
+        )
     return spec, summary
 
 
@@ -771,15 +827,19 @@ def _build_encoding_command(
 
 
 def _encode_segments(
-    video_files: Sequence[Path], tmpdir: Path, show_ffmpeg: bool = False
+    video_files: Sequence[Path],
+    tmpdir: Path,
+    show_ffmpeg: bool = False,
+    *,
+    verbose: bool = False,
 ) -> list[Path]:
     segments: list[Path] = []
     total = len(video_files)
     for index, video_path in enumerate(video_files, start=1):
-        info = _probe_video_info(video_path)
+        info = _probe_video_info(video_path, verbose=verbose)
         trim_range = _determine_trim_range(video_path, info)
         crop_filter, crop_summary = _determine_crop_filter(
-            video_path, info, trim_range
+            video_path, info, trim_range, verbose=verbose
         )
         segment_path = tmpdir / f"segment_{index:03d}.mp4"
         summary_text = crop_summary.format_summary()
@@ -787,9 +847,19 @@ def _encode_segments(
             f"[{index}/{total}] Encoding {video_path.name} {summary_text}...",
             flush=True,
         )
+        if verbose and trim_range is not None:
+            _debug_print(
+                verbose,
+                (
+                    f"{video_path.name}: trimming to {trim_range[0]:.3f}-"
+                    f"{trim_range[1]:.3f} seconds"
+                ),
+            )
         cmd = _build_encoding_command(video_path, segment_path, crop_filter, trim_range)
         if show_ffmpeg:
             print(shlex.join(cmd), flush=True)
+        elif verbose:
+            _debug_print(verbose, f"ffmpeg command: {shlex.join(cmd)}")
         process = subprocess.run(cmd, check=False, capture_output=True, text=True)
         if process.returncode != 0:
             raise RuntimeError(
@@ -800,6 +870,8 @@ def _encode_segments(
                     ]
                 )
             )
+        if verbose and process.stderr:
+            _debug_print(verbose, f"ffmpeg stderr: {process.stderr.strip()}")
         segments.append(segment_path)
     return segments
 
@@ -879,6 +951,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print the full ffmpeg command for each segment.",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print detailed debugging information while exporting.",
+    )
     return parser
 
 
@@ -890,6 +967,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path: Path = args.output
     seed = args.seed
     show_ffmpeg: bool = args.show_ffmpeg
+    verbose: bool = args.verbose
 
     video_files = _list_videos(folder)
     if seed is not None:
@@ -899,7 +977,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory() as tmpdir_str:
         tmpdir = Path(tmpdir_str)
-        segments = _encode_segments(video_files, tmpdir, show_ffmpeg=show_ffmpeg)
+        segments = _encode_segments(
+            video_files,
+            tmpdir,
+            show_ffmpeg=show_ffmpeg,
+            verbose=verbose,
+        )
         _concat_segments(segments, output_path)
 
     print(f"Created {output_path} from {len(video_files)} videos.")
