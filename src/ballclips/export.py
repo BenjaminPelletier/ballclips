@@ -453,7 +453,6 @@ def _determine_crop_filter(
         f"h='{_escape_ffmpeg_expr(size_expr_raw)}':"
         f"x='{_escape_ffmpeg_expr(x_expr_raw)}':"
         f"y='{_escape_ffmpeg_expr(y_expr_raw)}'"
-        + (":eval=frame" if animated else "")
     )
 
     def _round_rect(x: float, y: float, size: float) -> tuple[int, int, int, int]:
