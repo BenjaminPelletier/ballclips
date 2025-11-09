@@ -24,7 +24,7 @@ except (ValueError, ImportError):
 else:
     _GST_PBUTILS_AVAILABLE = True
 
-from gi.repository import Gdk, GLib, Gst, Gtk, Pango, cairo
+from gi.repository import Gdk, GLib, Gst, Gtk, cairo
 
 from implicitdict import ImplicitDict
 
@@ -190,19 +190,33 @@ class PlayerWindow(Gtk.ApplicationWindow):
         prev_button.connect("clicked", self._on_prev_clicked)
         header.pack_start(prev_button, False, False, 0)
 
-        title_label = Gtk.Label()
-        title_label.set_hexpand(True)
-        title_label.set_ellipsize(Pango.EllipsizeMode.END)
-        title_label.set_max_width_chars(60)
-        title_label.set_halign(Gtk.Align.CENTER)
-        title_label.set_xalign(0.5)
-        header.pack_start(title_label, True, True, 0)
+        prev_unannotated_button = Gtk.Button(label="<<")
+        prev_unannotated_button.connect(
+            "clicked", self._on_prev_unannotated_clicked
+        )
+        header.pack_start(prev_unannotated_button, False, False, 0)
+
+        video_selector = Gtk.ComboBoxText.new()
+        video_selector.set_hexpand(True)
+        video_selector.set_wrap_width(1)
+        header.pack_start(video_selector, True, True, 0)
+
+        next_unannotated_button = Gtk.Button(label=">>")
+        next_unannotated_button.connect(
+            "clicked", self._on_next_unannotated_clicked
+        )
+        header.pack_start(next_unannotated_button, False, False, 0)
 
         next_button = Gtk.Button.new_from_icon_name("go-next", Gtk.IconSize.BUTTON)
         next_button.connect("clicked", self._on_next_clicked)
         header.pack_start(next_button, False, False, 0)
 
-        self._title_label = title_label
+        self._video_selector = video_selector
+        self._video_selector_handler_id = video_selector.connect(
+            "changed", self._on_video_selector_changed
+        )
+        self._prev_unannotated_button = prev_unannotated_button
+        self._next_unannotated_button = next_unannotated_button
 
         container.pack_start(header, False, False, 0)
         container.pack_start(video_overlay, True, True, 0)
@@ -393,7 +407,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         trim_range = self._video_trim_ranges.get(video_file)
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
-        self._title_label.set_text(video_file.name)
+        self._refresh_video_selector(self._current_index)
+        self._update_unannotated_navigation_state()
 
         self._player.set_state(Gst.State.READY)
         self._player.set_property("uri", uri)
@@ -419,6 +434,54 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_overlay.queue_draw()
 
         self._app.set_current_index(self._current_index)
+
+    def _refresh_video_selector(self, active_index: int | None = None) -> None:
+        combo = getattr(self, "_video_selector", None)
+        if combo is None:
+            return
+        handler_id = getattr(self, "_video_selector_handler_id", None)
+        if active_index is None:
+            active_index = self._current_index
+        if handler_id is not None:
+            combo.handler_block(handler_id)
+        combo.remove_all()
+        for video_file in self._video_files:
+            combo.append_text(self._format_video_selector_label(video_file))
+        if active_index is not None and 0 <= active_index < len(self._video_files):
+            combo.set_active(active_index)
+        else:
+            combo.set_active(-1)
+        if handler_id is not None:
+            combo.handler_unblock(handler_id)
+
+    def _format_video_selector_label(self, video_file: Path) -> str:
+        label = video_file.name
+        if self._has_metadata_file(video_file):
+            label = f"{label} ✓"
+        return label
+
+    def _has_metadata_file(self, video_file: Path) -> bool:
+        return self._metadata_path(video_file).exists()
+
+    def _find_unannotated_index(self, *, direction: int) -> int | None:
+        if not self._video_files:
+            return None
+        count = len(self._video_files)
+        for step in range(1, count + 1):
+            index = (self._current_index + direction * step) % count
+            if index == self._current_index:
+                continue
+            if not self._has_metadata_file(self._video_files[index]):
+                return index
+        return None
+
+    def _update_unannotated_navigation_state(self) -> None:
+        prev_button = getattr(self, "_prev_unannotated_button", None)
+        next_button = getattr(self, "_next_unannotated_button", None)
+        if prev_button is None or next_button is None:
+            return
+        prev_button.set_sensitive(self._find_unannotated_index(direction=-1) is not None)
+        next_button.set_sensitive(self._find_unannotated_index(direction=1) is not None)
 
     def _ensure_discoverer(self) -> GstPbutilsTypes.Discoverer | None:  # type: ignore[attr-defined]
         if not _GST_PBUTILS_AVAILABLE:
@@ -655,11 +718,28 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
         self._crop_overlay.queue_draw()
 
+    def _on_video_selector_changed(self, combo: Gtk.ComboBoxText) -> None:
+        index = combo.get_active()
+        if index < 0 or index >= len(self._video_files):
+            return
+        if index != self._current_index:
+            self._load_video(index)
+
     def _on_prev_clicked(self, _button: Gtk.Button) -> None:
         self._load_video(self._current_index - 1)
 
     def _on_next_clicked(self, _button: Gtk.Button) -> None:
         self._load_video(self._current_index + 1)
+
+    def _on_prev_unannotated_clicked(self, _button: Gtk.Button) -> None:
+        target = self._find_unannotated_index(direction=-1)
+        if target is not None:
+            self._load_video(target)
+
+    def _on_next_unannotated_clicked(self, _button: Gtk.Button) -> None:
+        target = self._find_unannotated_index(direction=1)
+        if target is not None:
+            self._load_video(target)
 
     def _reset_trims_if_needed(self) -> None:
         duration_seconds = self._progress_adjustment.get_upper()
@@ -766,6 +846,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 json.dump(metadata, handle, indent=2, sort_keys=True)
                 handle.write("\n")
             self._crop_region_dirty = False
+            self._refresh_video_selector(self._current_index)
+            self._update_unannotated_navigation_state()
         except OSError as exc:
             print(
                 f"Failed to write metadata for '{video_file.name}': {exc}",
