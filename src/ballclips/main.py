@@ -201,6 +201,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         video_selector.set_wrap_width(1)
         header.pack_start(video_selector, True, True, 0)
 
+        refresh_button = Gtk.Button(label="↻")
+        refresh_button.connect("clicked", self._on_refresh_video_list_clicked)
+        header.pack_start(refresh_button, False, False, 0)
+
         next_unannotated_button = Gtk.Button(label=">>")
         next_unannotated_button.connect(
             "clicked", self._on_next_unannotated_clicked
@@ -217,6 +221,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         )
         self._prev_unannotated_button = prev_unannotated_button
         self._next_unannotated_button = next_unannotated_button
+        self._metadata_cache: dict[Path, bool] = {}
+        self._video_selector_initialized = False
 
         container.pack_start(header, False, False, 0)
         container.pack_start(video_overlay, True, True, 0)
@@ -435,13 +441,33 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
         self._app.set_current_index(self._current_index)
 
-    def _refresh_video_selector(self, active_index: int | None = None) -> None:
+    def _refresh_video_selector(
+        self,
+        active_index: int | None = None,
+        *,
+        force_rescan: bool = False,
+    ) -> None:
+        combo = getattr(self, "_video_selector", None)
+        if combo is None:
+            return
+        if active_index is None:
+            active_index = self._current_index
+        needs_rebuild = force_rescan or not getattr(
+            self, "_video_selector_initialized", False
+        )
+        if needs_rebuild:
+            for video_file in self._video_files:
+                self._has_metadata_file(video_file, refresh=True)
+            self._rebuild_video_selector(active_index)
+            self._video_selector_initialized = True
+        else:
+            self._set_video_selector_active(active_index)
+
+    def _rebuild_video_selector(self, active_index: int | None) -> None:
         combo = getattr(self, "_video_selector", None)
         if combo is None:
             return
         handler_id = getattr(self, "_video_selector_handler_id", None)
-        if active_index is None:
-            active_index = self._current_index
         if handler_id is not None:
             combo.handler_block(handler_id)
         combo.remove_all()
@@ -454,14 +480,58 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if handler_id is not None:
             combo.handler_unblock(handler_id)
 
+    def _set_video_selector_active(self, active_index: int | None) -> None:
+        combo = getattr(self, "_video_selector", None)
+        if combo is None:
+            return
+        handler_id = getattr(self, "_video_selector_handler_id", None)
+        if handler_id is not None:
+            combo.handler_block(handler_id)
+        if active_index is not None and 0 <= active_index < len(self._video_files):
+            combo.set_active(active_index)
+        else:
+            combo.set_active(-1)
+        if handler_id is not None:
+            combo.handler_unblock(handler_id)
+
+    def _update_video_selector_label(self, video_file: Path) -> None:
+        combo = getattr(self, "_video_selector", None)
+        if combo is None:
+            return
+        try:
+            index = self._video_files.index(video_file)
+        except ValueError:
+            return
+        handler_id = getattr(self, "_video_selector_handler_id", None)
+        active_index = combo.get_active()
+        model = combo.get_model()
+        if model is None or index >= model.iter_n_children(None):
+            return
+        if handler_id is not None:
+            combo.handler_block(handler_id)
+        combo.remove(index)
+        combo.insert_text(index, self._format_video_selector_label(video_file))
+        combo.set_active(active_index)
+        if handler_id is not None:
+            combo.handler_unblock(handler_id)
+
+    def _set_metadata_presence(self, video_file: Path, has_metadata: bool) -> None:
+        previous = self._metadata_cache.get(video_file)
+        self._metadata_cache[video_file] = has_metadata
+        if previous != has_metadata:
+            self._update_video_selector_label(video_file)
+        self._update_unannotated_navigation_state()
+
     def _format_video_selector_label(self, video_file: Path) -> str:
         label = video_file.name
-        if self._has_metadata_file(video_file):
+        if self._metadata_cache.get(video_file):
             label = f"{label} ✓"
         return label
 
-    def _has_metadata_file(self, video_file: Path) -> bool:
-        return self._metadata_path(video_file).exists()
+    def _has_metadata_file(self, video_file: Path, *, refresh: bool = False) -> bool:
+        if refresh or video_file not in self._metadata_cache:
+            self._metadata_cache[video_file] = self._metadata_path(video_file).exists()
+        return self._metadata_cache[video_file]
 
     def _find_unannotated_index(self, *, direction: int) -> int | None:
         if not self._video_files:
@@ -741,6 +811,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if target is not None:
             self._load_video(target)
 
+    def _on_refresh_video_list_clicked(self, _button: Gtk.Button) -> None:
+        self._refresh_video_selector(force_rescan=True)
+        self._update_unannotated_navigation_state()
+
     def _reset_trims_if_needed(self) -> None:
         duration_seconds = self._progress_adjustment.get_upper()
         if duration_seconds <= 0:
@@ -846,8 +920,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
                 json.dump(metadata, handle, indent=2, sort_keys=True)
                 handle.write("\n")
             self._crop_region_dirty = False
-            self._refresh_video_selector(self._current_index)
-            self._update_unannotated_navigation_state()
+            self._set_metadata_presence(video_file, True)
         except OSError as exc:
             print(
                 f"Failed to write metadata for '{video_file.name}': {exc}",
