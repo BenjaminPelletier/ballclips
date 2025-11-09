@@ -924,14 +924,28 @@ def _list_videos(folder: Path) -> list[Path]:
     return video_files
 
 
+def _collect_input_videos(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        if input_path.suffix.lower() != ".mp4":
+            raise FileNotFoundError(
+                f"Input file '{input_path}' is not an MP4 video."
+            )
+        return [input_path]
+    if input_path.is_dir():
+        return _list_videos(input_path)
+    raise FileNotFoundError(
+        f"Input path '{input_path}' does not exist or is not accessible."
+    )
+
+
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Export cropped videos from a folder into a single compilation.",
+        description="Export cropped videos from one or more input files into a single compilation.",
     )
     parser.add_argument(
-        "folder",
+        "input",
         type=Path,
-        help="Path to the folder containing input MP4 files.",
+        help="Path to an input MP4 file or a folder containing MP4 files.",
     )
     parser.add_argument(
         "-o",
@@ -963,13 +977,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = build_argument_parser()
     args = parser.parse_args(argv)
 
-    folder: Path = args.folder
+    input_path: Path = args.input
     output_path: Path = args.output
     seed = args.seed
     show_ffmpeg: bool = args.show_ffmpeg
     verbose: bool = args.verbose
 
-    video_files = _list_videos(folder)
+    video_files = _collect_input_videos(input_path)
     if seed is not None:
         random.Random(seed).shuffle(video_files)
     else:
