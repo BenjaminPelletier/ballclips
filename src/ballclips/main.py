@@ -704,14 +704,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
             self._video_trim_ranges.pop(video_file, None)
 
         self._video_crop_regions[video_file] = {
-            "in": in_region.clamped(),
-            "out": out_region.clamped(),
+            "in": self._clamp_region_to_video_bounds(
+                in_region, self._current_video_pixel_size
+            ),
+            "out": self._clamp_region_to_video_bounds(
+                out_region, self._current_video_pixel_size
+            ),
         }
 
     def _get_crop_region(self, video_file: Path, key: Literal["in", "out"]) -> CropRegion:
         self._ensure_crop_defaults(video_file)
         stored = self._video_crop_regions[video_file][key]
-        return stored.clamped()
+        return self._clamp_region_to_video_bounds(stored, self._current_video_pixel_size)
 
     def _metadata_path(self, video_file: Path) -> Path:
         return video_file.with_suffix(".json")
@@ -741,8 +745,12 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _save_video_metadata(self, video_file: Path) -> None:
         self._ensure_crop_defaults(video_file)
         metadata_path = self._metadata_path(video_file)
-        in_region = self._video_crop_regions[video_file]["in"].clamped()
-        out_region = self._video_crop_regions[video_file]["out"].clamped()
+        in_region = self._clamp_region_to_video_bounds(
+            self._video_crop_regions[video_file]["in"], self._current_video_pixel_size
+        )
+        out_region = self._clamp_region_to_video_bounds(
+            self._video_crop_regions[video_file]["out"], self._current_video_pixel_size
+        )
         trim_in = max(0.0, self._trim_in_seconds)
         trim_out = max(trim_in, self._trim_out_seconds)
         self._video_trim_ranges[video_file] = (trim_in, trim_out)
@@ -772,9 +780,10 @@ class PlayerWindow(Gtk.ApplicationWindow):
     def _crop_region_to_square_point(self, region: CropRegion, seconds: float) -> SquareCroppingPoint:
         video_w, video_h = self._current_video_pixel_size or (0.0, 0.0)
         min_dimension = min(video_w, video_h) if video_w > 0 and video_h > 0 else 0.0
-        u = int(round(region.center_x * video_w)) if video_w > 0 else 0
-        v = int(round(region.center_y * video_h)) if video_h > 0 else 0
-        size = int(round(region.size * min_dimension)) if min_dimension > 0 else 0
+        clamped_region = self._clamp_region_to_video_bounds(region, (video_w, video_h))
+        u = int(round(clamped_region.center_x * video_w)) if video_w > 0 else 0
+        v = int(round(clamped_region.center_y * video_h)) if video_h > 0 else 0
+        size = int(round(clamped_region.size * min_dimension)) if min_dimension > 0 else 0
         return SquareCroppingPoint(
             frame=self._seconds_to_frame(seconds),
             u=u,
@@ -804,7 +813,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         center_x = float(u) / video_w
         center_y = float(v) / video_h
         size_ratio = float(size) / min_dimension
-        return CropRegion(center_x, center_y, size_ratio).clamped()
+        region = CropRegion(center_x, center_y, size_ratio).clamped()
+        return self._clamp_region_to_video_bounds(region, (video_w, video_h))
 
     def _square_point_to_trim_seconds(self, point: SquareCroppingPoint) -> float | None:
         frame = getattr(point, "frame", None)
@@ -870,6 +880,18 @@ class PlayerWindow(Gtk.ApplicationWindow):
         center_x = center_x_px / video_w if video_w > 0 else 0.5
         center_y = center_y_px / video_h if video_h > 0 else 0.5
         return CropRegion(center_x, center_y, normalized_size).clamped()
+
+    def _clamp_region_to_video_bounds(
+        self,
+        region: CropRegion,
+        video_size: tuple[float, float] | None,
+    ) -> CropRegion:
+        if not video_size:
+            return region.clamped()
+        video_w, video_h = video_size
+        if video_w <= 0 or video_h <= 0:
+            return region.clamped()
+        return self._clamp_region_to_video_area(region, (0.0, 0.0, video_w, video_h))
 
     def _point_in_video_area(self, x: float, y: float, width: int, height: int) -> bool:
         offset_x, offset_y, video_w, video_h = self._get_video_display_rect(width, height)

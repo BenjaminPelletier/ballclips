@@ -59,12 +59,13 @@ export them into a single compilation. The `ballclips-export` CLI is published
 with this project, so you can invoke it directly with `uv run`:
 
 ```bash
-uv run ballclips-export <path-to-folder-with-videos>
+uv run ballclips-export <path-to-video-or-folder>
 ```
 
-By default the compilation is saved as `ballclips_compilation.mp4` next to the
-input folder. Pass `--output` to choose a different destination or filename and
-`--seed` to make the shuffling of clips deterministic:
+You can pass either a single MP4 file or a folder containing multiple MP4s.
+By default the compilation is saved as `ballclips_compilation.mp4` in the
+current directory. Pass `--output` to choose a different destination or
+filename and `--seed` to make the shuffling of clips deterministic:
 
 ```bash
 uv run ballclips-export ~/shared/clips --output ~/exports/my-compilation.mp4 --seed 1234
