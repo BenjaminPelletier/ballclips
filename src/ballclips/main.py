@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from dataclasses import dataclass
 from fractions import Fraction
@@ -779,11 +780,54 @@ class PlayerWindow(Gtk.ApplicationWindow):
 
     def _crop_region_to_square_point(self, region: CropRegion, seconds: float) -> SquareCroppingPoint:
         video_w, video_h = self._current_video_pixel_size or (0.0, 0.0)
-        min_dimension = min(video_w, video_h) if video_w > 0 and video_h > 0 else 0.0
+        if video_w <= 0.0 or video_h <= 0.0:
+            min_dimension = 0
+        else:
+            min_dimension = int(round(min(video_w, video_h)))
         clamped_region = self._clamp_region_to_video_bounds(region, (video_w, video_h))
-        u = int(round(clamped_region.center_x * video_w)) if video_w > 0 else 0
-        v = int(round(clamped_region.center_y * video_h)) if video_h > 0 else 0
-        size = int(round(clamped_region.size * min_dimension)) if min_dimension > 0 else 0
+        if min_dimension <= 0:
+            size = 0
+        else:
+            size_float = max(0.0, min(clamped_region.size, 1.0)) * float(min_dimension)
+            size = int(round(size_float))
+            size = max(1, min(size, min_dimension))
+
+        width_px = int(round(video_w)) if video_w > 0.0 else 0
+        height_px = int(round(video_h)) if video_h > 0.0 else 0
+        if width_px <= 0 or height_px <= 0:
+            u = 0
+            v = 0
+        else:
+            center_x = clamped_region.center_x * width_px
+            center_y = clamped_region.center_y * height_px
+            half = size / 2.0 if size > 0 else 0.0
+
+            min_center_x = math.ceil(half)
+            max_center_x = math.floor(width_px - half)
+            if min_center_x > max_center_x:
+                center_x = width_px / 2.0
+                min_center_x = max_center_x = int(round(center_x))
+            else:
+                center_x = min(max(center_x, min_center_x), max_center_x)
+
+            min_center_y = math.ceil(half)
+            max_center_y = math.floor(height_px - half)
+            if min_center_y > max_center_y:
+                center_y = height_px / 2.0
+                min_center_y = max_center_y = int(round(center_y))
+            else:
+                center_y = min(max(center_y, min_center_y), max_center_y)
+
+            u = int(round(center_x))
+            v = int(round(center_y))
+            if min_center_x <= max_center_x:
+                u = max(min_center_x, min(max_center_x, u))
+            else:
+                u = int(round(width_px / 2.0))
+            if min_center_y <= max_center_y:
+                v = max(min_center_y, min(max_center_y, v))
+            else:
+                v = int(round(height_px / 2.0))
         return SquareCroppingPoint(
             frame=self._seconds_to_frame(seconds),
             u=u,
