@@ -325,6 +325,8 @@ class PlayerWindow(Gtk.ApplicationWindow):
         self._crop_drag_key: Literal["in", "out"] | None = None
         self._crop_initial_region: CropRegion | None = None
         self._crop_edit_tolerance = 1e-3
+        self._crop_override_key: Literal["in", "out"] | None = None
+        self._crop_override_target: float | None = None
         self._video_crop_regions: dict[Path, dict[str, CropRegion]] = {}
         self._video_trim_ranges: dict[Path, tuple[float, float]] = {}
         self._crop_region_dirty = False
@@ -413,6 +415,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         trim_range = self._video_trim_ranges.get(video_file)
         uri = Gst.filename_to_uri(str(video_file.resolve()))
 
+        self._clear_crop_override()
         self._refresh_video_selector(self._current_index)
         self._update_unannotated_navigation_state()
 
@@ -1176,11 +1179,43 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._current_video_file is None:
             return None
         position = self._progress_adjustment.get_value()
-        if abs(position - self._trim_in_seconds) <= self._crop_edit_tolerance:
+        tolerance = self._trim_match_tolerance()
+        if abs(position - self._trim_in_seconds) <= tolerance:
+            self._clear_crop_override()
             return "in"
-        if abs(position - self._trim_out_seconds) <= self._crop_edit_tolerance:
+        if abs(position - self._trim_out_seconds) <= tolerance:
+            self._clear_crop_override()
             return "out"
+        override_key = self._crop_override_key
+        if override_key is not None and self._crop_override_target is not None:
+            override_tolerance = max(tolerance, 0.5)
+            if abs(position - self._crop_override_target) <= override_tolerance:
+                return override_key
+            self._clear_crop_override()
         return None
+
+    def _trim_match_tolerance(self) -> float:
+        tolerance = self._crop_edit_tolerance
+        rate = self._current_video_frame_rate
+        if rate is not None:
+            num, den = rate
+            if num > 0 and den > 0:
+                fps = num / den
+                if fps > 0:
+                    return max(tolerance, 1.0 / fps)
+        return max(tolerance, 1.0 / 30.0)
+
+    def _set_crop_override(self, key: Literal["in", "out"]) -> None:
+        if key == "in":
+            target = self._trim_in_seconds
+        else:
+            target = self._trim_out_seconds
+        self._crop_override_key = key
+        self._crop_override_target = target
+
+    def _clear_crop_override(self) -> None:
+        self._crop_override_key = None
+        self._crop_override_target = None
 
     def _fit_region_to_bounds(
         self, region: CropRegion, width: int, height: int
@@ -1557,6 +1592,7 @@ class PlayerWindow(Gtk.ApplicationWindow):
         position = self._progress_adjustment.get_value()
         self._trim_in_seconds = min(position, self._trim_out_seconds)
         self._pending_trim_reset = False
+        self._set_crop_override("in")
         self._trim_area.queue_draw()
         self._crop_overlay.queue_draw()
         self._persist_metadata_for_current_video()
@@ -1565,14 +1601,17 @@ class PlayerWindow(Gtk.ApplicationWindow):
         position = self._progress_adjustment.get_value()
         self._trim_out_seconds = max(position, self._trim_in_seconds)
         self._pending_trim_reset = False
+        self._set_crop_override("out")
         self._trim_area.queue_draw()
         self._crop_overlay.queue_draw()
         self._persist_metadata_for_current_video()
 
     def _on_go_to_in_clicked(self, _button: Gtk.Button) -> None:
+        self._set_crop_override("in")
         self._seek_to_seconds(self._trim_in_seconds)
 
     def _on_go_to_out_clicked(self, _button: Gtk.Button) -> None:
+        self._set_crop_override("out")
         self._seek_to_seconds(self._trim_out_seconds)
 
 
