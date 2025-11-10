@@ -1176,11 +1176,23 @@ class PlayerWindow(Gtk.ApplicationWindow):
         if self._current_video_file is None:
             return None
         position = self._progress_adjustment.get_value()
-        if abs(position - self._trim_in_seconds) <= self._crop_edit_tolerance:
+        tolerance = self._trim_match_tolerance()
+        if abs(position - self._trim_in_seconds) <= tolerance:
             return "in"
-        if abs(position - self._trim_out_seconds) <= self._crop_edit_tolerance:
+        if abs(position - self._trim_out_seconds) <= tolerance:
             return "out"
         return None
+
+    def _trim_match_tolerance(self) -> float:
+        tolerance = self._crop_edit_tolerance
+        rate = self._current_video_frame_rate
+        if rate is not None:
+            num, den = rate
+            if num > 0 and den > 0:
+                fps = num / den
+                if fps > 0:
+                    return max(tolerance, 1.0 / fps)
+        return max(tolerance, 1.0 / 30.0)
 
     def _fit_region_to_bounds(
         self, region: CropRegion, width: int, height: int
