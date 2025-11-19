@@ -2,12 +2,19 @@
 
 Batch video trimming, cropping tool, and composing tool for crystal ball video players.
 
+![Crystal ball video](./assets/crystal_ball.gif)
+
+Many Chinese sellers<sup>[1](https://a.aliexpress.com/_mO5snMN), [2](https://a.aliexpress.com/_m0JcoI9)</sup> sell a product that is a half-sphere crystal ball attached to a video screen so that the viewer can see videos playing "inside" the crystal ball (kind of like Harry Potter wizard portraits).  The downsides of these products are that videos need to have specific characteristics, and there isn't a "shuffle play" option -- instead, a specific video must be selected by hand to play.
+
+This project allows the owner of one (or more) of these crystal balls to assemble a large number of normal video clips into a single square-aspect-ratio video suitable for playing on the crystal ball.
+
 ## Requirements
 
-* [uv](https://github.com/astral-sh/uv) for dependency management and running the app.
+* Linux (confirmed to work in an Ubuntu VM on a Windows [VirtualBox](https://www.virtualbox.org/) host)
+* [uv](https://github.com/astral-sh/uv) for dependency management and running the app
 * Prerequisite packages (see below)
-* GStreamer 1.0 with the `gtksink` plugin (commonly available via `gstreamer1.0-plugins-good`).
-* GTK 3 and the PyGObject introspection bindings.
+* GStreamer 1.0 with the `gtksink` plugin (commonly available via `gstreamer1.0-plugins-good`)
+* GTK 3 and the PyGObject introspection bindings
 
 ```bash
 sudo apt install -y \
@@ -38,11 +45,20 @@ sudo apt install -y \
 
 ## Running the tool
 
-Place one or more `.mp4` files in a folder and run:
+Place one or more `.mp4` source files in a folder and run:
 
 ```bash
 uv run ballclips <path-to-folder-with-videos>
 ```
+
+* Set the start and end frames with the `{` and `}` buttons
+* Navigate to the start or end frames with the `→{` and `→}` buttons
+* When paused on a start or end frame:
+  * Drag the crop region by right-clicking and dragging
+  * Define a new crop region by left-clicking and dragging
+* Navigate between source videos with the `>` and `<` buttons
+* Navigate between source videos without cropping information with the `>>` and `<<` buttons
+* Once all videos have been assigned crop regions (if they shouldn't have the default centered crop region), proceed to export below
 
 To improve performance:
 
